@@ -1,0 +1,12 @@
+[project]
+name = "hermes-supermemory"
+version = "1.0.1"
+description = "Hermes Agent memory provider plugin: supermemory"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+# Installed into the Hermes venv by `hermes plugins install` / `enable` and re-applied after
+# every `hermes update` (hermes-agent#113851). Keep upper bounds: Hermes pins its own deps exactly
+# and refuses a plugin whose requirements cannot resolve against them.
+dependencies = [
+    "supermemory>=3.50.0,<4",
+]
