@@ -1,4 +1,4 @@
-> **Handoff repository.** This is the standalone copy of the `supermemory` memory provider formerly bundled with Hermes Agent, published so its upstream maintainers can take it over. Not an official Nous Research plugin. See [HANDOFF.md](HANDOFF.md).
+> The [Supermemory](https://supermemory.ai) memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent), maintained by Supermemory. It was previously bundled inside Hermes core. See [MAINTAINERS.md](MAINTAINERS.md).
 
 # Supermemory Memory Provider
 
@@ -13,6 +13,8 @@ Semantic long-term memory with profile recall, semantic search, explicit memory 
 ## Setup
 
 ```bash
+hermes plugins install supermemoryai/hermes-supermemory
+hermes plugins enable supermemory
 hermes memory setup    # select "supermemory"
 ```
 

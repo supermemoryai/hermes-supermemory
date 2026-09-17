@@ -1,4 +1,4 @@
-# Handoff notes — hermes-supermemory
+# Maintainer notes — hermes-supermemory
 
 This is the standalone `supermemory` memory provider for [Hermes](https://github.com/NousResearch/hermes-agent).
 It previously shipped inside `NousResearch/hermes-agent` under `plugins/memory/supermemory/`. Nous Research is
