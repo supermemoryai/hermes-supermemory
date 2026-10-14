@@ -37,8 +37,11 @@ Mechanical only; behaviour is identical.
 - The setup wizard imports private helpers from `hermes_cli.memory_setup` (`_curses_select`,
   `_prompt`, ...). Those are Hermes internals, not API; expect to own a copy or drop the wizard
   hook if they move.
-- Tests were not copied: the in-tree tests import `plugins.memory.supermemory` and depend on the
-  hermes-agent test harness. See `tests/plugins/memory/` in hermes-agent for the originals.
+- The in-tree tests were not copied (they depend on the hermes-agent test harness; see
+  `tests/plugins/memory/` in hermes-agent). `tests/` here stubs the few host modules the provider
+  imports and runs against the real SDK over a mock HTTP transport; see README → Development.
+- 2.0 moved to the v5 API (`supermemory>=5,<6`). `_SupermemoryClient` refuses other SDK majors at
+  construction; widen `_SDK_MAJOR` together with `pyproject.toml` and `plugin.yaml`.
 - While the in-tree copy still exists, a same-named user plugin is shadowed by it
   (bundled providers win on name). It takes effect the moment core drops `plugins/memory/supermemory`.
 

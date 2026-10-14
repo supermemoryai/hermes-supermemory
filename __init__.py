@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import importlib
+import importlib.metadata
 import json
 import logging
 import os
 import re
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -19,7 +20,10 @@ from tools.registry import tool_error
 logger = logging.getLogger(__name__)
 
 _DEFAULT_CONTAINER_TAG = "hermes"
-_VALID_SEARCH_MODES = ("hybrid", "memories", "documents")
+_VALID_SEARCH_MODES = ("hybrid", "memories", "chunks", "documents")  # "documents" = pre-v5 name for "chunks"
+_SDK_MAJOR = 5  # supermemory>=5,<6 (pyproject.toml / plugin.yaml): the namespace-first v5 API
+# v5 lowered the server defaults (threshold 0.3); send the pre-v5 search behaviour explicitly so recall precision is unchanged.
+_SEARCH_DEFAULTS = {"threshold": 0.6, "rerank": "none", "rewrite_query": False}
 _DEFAULT_BASE_URL = "https://api.supermemory.ai"
 _API_KEY_URL = "https://console.supermemory.ai/keys?create=true"
 # Strips injected <supermemory-context> / <supermemory-containers> blocks before capture.
@@ -168,23 +172,55 @@ def _clean_text_for_capture(text: str) -> str:
     return _DATA_URI_RE.sub("[image]", _INJECTED_BLOCK_RE.sub("", text or "")).strip()
 
 
-def _memory_fields(item: Any, *keys: str) -> dict:
-    """Pick SDK result attrs into a plain dict; ``updated_at`` also accepts camelCase ``updatedAt``."""
-    defaults = {"id": "", "memory": "", "similarity": None, "metadata": None}
-    return {k: getattr(item, "updated_at", None) or getattr(item, "updatedAt", None) if k == "updated_at" else getattr(item, k, defaults[k])
-            for k in keys}
+def _field(item: Any, name: str, default: Any = None) -> Any:
+    """Read a field from an SDK model or a plain dict (e.g. after ``model_dump``)."""
+    return item.get(name, default) if isinstance(item, dict) else getattr(item, name, default)
+
+
+def _memory_text(item: Any) -> str:
+    """Hybrid/chunk hits leave ``memory`` empty and carry their text in ``chunk`` (or a ``chunks`` list)."""
+    for key in ("memory", "chunk"):
+        if isinstance(text := _field(item, key), str) and text.strip():
+            return text
+    texts = (c if isinstance(c, str) else _field(c, "content") for c in _field(item, "chunks") or [])
+    return "\n".join(t for t in texts if isinstance(t, str) and t.strip())
+
+
+def _memory_fields(item: Any) -> dict:
+    """v5 search hit -> plain dict; ``updated_at`` comes from ``system.updatedAt`` (top-level fields kept as fallback)."""
+    system = _field(item, "system")
+    updated = next((v for v in (_field(system, "updated_at"), _field(system, "updatedAt"),
+                                _field(item, "updated_at"), _field(item, "updatedAt")) if v), None)
+    return {"id": _field(item, "id", "") or "", "memory": _memory_text(item), "similarity": _field(item, "similarity"),
+            "updated_at": updated.isoformat() if isinstance(updated, datetime) else updated, "metadata": _field(item, "metadata")}
+
+
+def _profile_fields(response: Any) -> dict:
+    """v5 profile facts are ``{id, memory}`` objects: keep their text, never the model repr."""
+    profile = _field(response, "profile")
+    texts = {key: [t for f in (_field(profile, key) or []) if isinstance(t := f if isinstance(f, str) else _field(f, "memory"), str) and t.strip()]
+             for key in ("static", "dynamic")}
+    return {**texts, "search_results": []}
+
+
+def _error_text(exc: BaseException) -> str:
+    return str(exc).strip()[:160] or type(exc).__name__
 
 
 class _SupermemoryClient:
     def __init__(self, api_key: str, timeout: float, container_tag: str,
                  search_mode: str = "hybrid", base_url: str = ""):
-        # Lazy-install the SDK on demand (honors security.allow_lazy_installs and sealed Docker
-        # venvs). On failure fall through so the raw import produces the canonical ImportError.
-        pass  # dependencies come from pyproject.toml (installed by Hermes on install/enable/update)
+        # Dependencies come from pyproject.toml (installed by Hermes on install/enable/update). Another
+        # component can still pin an older SDK into the shared venv; fail here with a clear message
+        # instead of letting every v5 call fail later.
         from supermemory import Supermemory
+        if not (sdk_version := importlib.metadata.version("supermemory")).startswith(f"{_SDK_MAJOR}."):
+            raise RuntimeError(f"supermemory {sdk_version} is installed; this provider needs supermemory>={_SDK_MAJOR},<{_SDK_MAJOR + 1}")
         self._api_key, self._container_tag, self._timeout = api_key, container_tag, timeout
         self._search_mode = search_mode if search_mode in _VALID_SEARCH_MODES else "hybrid"
         self._base_url = _resolve_base_url(base_url)
+        # max_retries=0: SDK retries would re-POST an append the server may already have accepted (duplicated turns).
+        # Failed capture writes are retried once per provider hook instead (see _write_turns).
         self._client = Supermemory(api_key=api_key, base_url=self._base_url, timeout=timeout, max_retries=0,
                                    default_headers={"x-sm-source": "hermes"})
 
@@ -198,37 +234,63 @@ class _SupermemoryClient:
 
     def add_memory(self, content: str, metadata: Optional[dict] = None, *, entity_context: str = "",
                    container_tag: Optional[str] = None, custom_id: Optional[str] = None) -> dict:
-        kwargs: dict[str, Any] = {"content": content.strip(), "container_tags": [container_tag or self._container_tag],
+        # The v5 namespace is the pre-v5 container tag. POST with an existing ``id`` appends to that document
+        # (PATCH would replace it). task_type="memory" keeps the pre-v5 extraction pipeline explicit.
+        kwargs: dict[str, Any] = {"content": content.strip(), "task_type": "memory",
                                   **({"metadata": self._merge_metadata(metadata)} if metadata else {}),
-                                  **({"entity_context": _clamp_entity_context(entity_context)} if entity_context else {}),
-                                  **({"custom_id": custom_id} if custom_id else {})}
-        return {"id": getattr(self._client.documents.add(**kwargs), "id", "")}
+                                  **({"supporting_context": _clamp_entity_context(entity_context)} if entity_context else {}),
+                                  **({"id": custom_id} if custom_id else {})}
+        return {"id": _field(self._client.add(container_tag or self._container_tag, **kwargs), "id", "") or ""}
 
     def search_memories(self, query: str, *, limit: int = 5, container_tag: Optional[str] = None,
                         search_mode: Optional[str] = None) -> list[dict]:
         mode = search_mode or self._search_mode
-        kwargs: dict[str, Any] = {"q": query, "container_tag": container_tag or self._container_tag, "limit": limit,
-                                  **({"search_mode": mode} if mode in _VALID_SEARCH_MODES else {})}
-        response = self._client.search.memories(**kwargs)
-        return [{**_memory_fields(item, "id", "memory", "similarity", "updated_at", "metadata"), "memory": getattr(item, "memory", "") or ""}
-                for item in (getattr(response, "results", None) or [])]
+        response = self._client.search(container_tag or self._container_tag, query=query, limit=limit,
+                                       search_mode="chunks" if mode == "documents" else mode, **_SEARCH_DEFAULTS)
+        return [_memory_fields(item) for item in (_field(response, "results") or [])]
 
-    def get_profile(self, query: Optional[str] = None, *, container_tag: Optional[str] = None) -> dict:
-        response = self._client.profile(container_tag=container_tag or self._container_tag, **({"q": query} if query else {}))
-        profile_data = getattr(response, "profile", None)
-        search_data = getattr(response, "search_results", None) or getattr(response, "searchResults", None)
-        raw_results = getattr(search_data, "results", None) or search_data or []
-        return {
-            **{k: (getattr(profile_data, k, []) or []) if profile_data else [] for k in ("static", "dynamic")},
-            "search_results": [item if isinstance(item, dict) else _memory_fields(item, "memory", "updated_at", "similarity")
-                               for item in raw_results] if isinstance(raw_results, list) else [],
-        }
+    def get_profile(self, query: Optional[str] = None, *, container_tag: Optional[str] = None, limit: int = 10) -> dict:
+        namespace = container_tag or self._container_tag
+        if not query:
+            return _profile_fields(self._client.profile(namespace))
+        # The v5 profile endpoint takes no query, so recall is two requests. The search runs on one short-lived
+        # helper thread while the profile is fetched here, and the join is capped at the SDK timeout, so recall
+        # still costs about one request of wall time. A failed or late leg is reported in "errors" and the
+        # other leg is still used; only when both fail does this raise.
+        deadline, search, errors = time.monotonic() + self._timeout, {}, {}
+
+        def _search() -> None:
+            try:
+                search["results"] = self.search_memories(query, limit=limit, container_tag=namespace)
+            except Exception as exc:
+                search["error"] = _error_text(exc)
+        worker = spawn_context_thread(_search, daemon=True, name="supermemory-recall-search")
+        worker.start()
+        try:
+            result = _profile_fields(self._client.profile(namespace))
+        except Exception as exc:
+            result, errors["profile"] = _profile_fields(None), _error_text(exc)
+        worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        if (results := search.get("results")) is not None:
+            result["search_results"] = results
+        else:
+            errors["search"] = search.get("error") or "timed out"
+        if len(errors) == 2:
+            raise RuntimeError(f"profile: {errors['profile']}; search: {errors['search']}")
+        if errors:
+            logger.debug("Supermemory recall partially failed: %s", errors)
+        return {**result, "errors": errors}
 
     def forget_memory(self, memory_id: str, *, container_tag: Optional[str] = None) -> None:
-        self._client.memories.forget(container_tag=container_tag or self._container_tag, id=memory_id)
+        response = self._client.memories.forget(container_tag or self._container_tag, ids=[memory_id])
+        # v5 reports per-id outcomes instead of raising: only an exact match for this one id counts as forgotten.
+        errors = [str(_field(e, "error", "")) for e in _field(response, "errors") or []]
+        if errors or [_field(m, "id") for m in _field(response, "matches") or []] != [memory_id]:
+            raise RuntimeError(f"Supermemory did not confirm forgetting {memory_id}" + (f": {'; '.join(errors)}" if errors else ""))
 
     def forget_by_query(self, query: str, *, container_tag: Optional[str] = None) -> dict:
-        results = self.search_memories(query, limit=5, container_tag=container_tag)
+        # Memories mode only: a hybrid hit can be a chunk, and a chunk id is not a forgettable memory id.
+        results = self.search_memories(query, limit=5, container_tag=container_tag, search_mode="memories")
         memory_id = results[0].get("id", "") if results else ""
         if not memory_id:
             return {"success": False, "message": "Best matching memory has no id." if results else "No matching memory found to forget."}
@@ -310,6 +372,11 @@ class _TagError(Exception):
 
 def _tagged(resp: dict, tag: Optional[str]) -> dict:
     return {**resp, "container_tag": tag} if tag else resp
+
+
+def _tool_result(item: dict) -> dict:
+    return {"id": item.get("id", ""), "content": item.get("memory", ""),
+            **({"similarity": pct} if (pct := _similarity_pct(item.get("similarity"))) is not None else {})}
 
 
 class SupermemoryMemoryProvider(MemoryProvider):
@@ -409,14 +476,14 @@ class SupermemoryMemoryProvider(MemoryProvider):
         if not self._active or not self._auto_recall or not self._client or not query.strip():
             return ""
         def _recall():
-            profile = self._client.get_profile(query=query[:200])
+            profile = self._client.get_profile(query=query[:200], limit=self._max_recall_results)
             include_profile = self._turn_count <= 1 or (self._turn_count % self._profile_frequency == 0)
             return _format_prefetch_context(profile["static"] if include_profile else [], profile["dynamic"] if include_profile else [],
                                             profile["search_results"], self._max_recall_results)
         return _quietly(_recall, "Supermemory prefetch failed", default="")
 
     def _write_turns(self, mode: str, new_turn: Optional[Dict[str, str]] = None) -> None:
-        """Write pending turns (+ ``new_turn``) as one documents.add per session id; custom_id = session + 4h bucket, so the
+        """Write pending turns (+ ``new_turn``) as one add per session id; id = session + 4h bucket, so the
         API appends deltas. Failed batches stay pending under their own session id, so a switch never re-homes them.
         Retries are at-least-once: a write the API accepted but whose response was lost is re-sent and appended again.
         The lock serializes the snapshot/write/replace sequence across the worker and caller threads."""
@@ -536,8 +603,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
             return tool_error("query is required")
         limit = _clamp_number(args.get("limit", 5) or 5, 5, 1, 20, int)
         tag = self._tool_container_tag(args)
-        results = [{"id": i.get("id", ""), "content": i.get("memory", ""), **({"similarity": pct} if (pct := _similarity_pct(i.get("similarity"))) is not None else {})}
-                   for i in self._client.search_memories(query, limit=limit, container_tag=tag)]
+        results = [_tool_result(i) for i in self._client.search_memories(query, limit=limit, container_tag=tag)]
         return _tagged({"results": results, "count": len(results)}, tag)
 
     def _tool_forget(self, args: dict) -> dict | str:
@@ -552,9 +618,13 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
     def _tool_profile(self, args: dict) -> dict:
         tag = self._tool_container_tag(args)
-        profile = self._client.get_profile(query=str(args.get("query") or "").strip() or None, container_tag=tag)
-        return _tagged({"profile": "\n\n".join(_profile_sections(profile["static"], profile["dynamic"])),
-                       "static_count": len(profile["static"]), "dynamic_count": len(profile["dynamic"])}, tag)
+        query = str(args.get("query") or "").strip() or None
+        profile = self._client.get_profile(query=query, container_tag=tag)
+        resp = {"profile": "\n\n".join(_profile_sections(profile["static"], profile["dynamic"])),
+                "static_count": len(profile["static"]), "dynamic_count": len(profile["dynamic"])}
+        if query:  # v5 profiles take no query, so the query focuses a separate memory search
+            resp["results"] = [_tool_result(i) for i in profile["search_results"]]
+        return _tagged({**resp, **({"errors": profile["errors"]} if profile.get("errors") else {})}, tag)
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         """Handlers return a tool_error() string for bad args or a dict to JSON-encode; client failures get ``fail_prefix``."""
