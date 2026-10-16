@@ -21,9 +21,10 @@ Dependencies in `pyproject.toml` are installed into the Hermes venv automaticall
 
 ## What changed versus the in-tree copy
 
-Mechanical only; behaviour is identical.
+1.0.x was a mechanical extraction; behaviour was identical. 2.0 moved it to the 5.x SDK and the v5 namespace API
+(see "Upgrading from 1.x" in the README). As extracted:
 
-- Added `pyproject.toml` declaring: `supermemory>=3.50.0,<4`.
+- Added `pyproject.toml` declaring: `supermemory>=3.50.0,<4` (2.0: `supermemory>=5.0.0,<6`).
 - Dropped the `tools.lazy_deps.ensure("memory.supermemory")` call (see below). This is the only code change.
 - Single-file package, so no self-imports needed rewriting and no shared helpers were vendored.
 - Fixed the API key link: it was `http://app.supermemory.ai/integrations?connect=hermes`, which is no longer
@@ -37,8 +38,8 @@ Mechanical only; behaviour is identical.
 - The setup wizard imports private helpers from `hermes_cli.memory_setup` (`_curses_select`,
   `_prompt`, ...). Those are Hermes internals, not API; expect to own a copy or drop the wizard
   hook if they move.
-- Tests were not copied: the in-tree tests import `plugins.memory.supermemory` and depend on the
-  hermes-agent test harness. See `tests/plugins/memory/` in hermes-agent for the originals.
+- Tests live in `tests/` and need Hermes Agent importable (install it and this plugin's dependencies into one venv):
+  `pip install -e <hermes-agent checkout> 'supermemory>=5.0.0,<6' pytest && python -m pytest tests`.
 - While the in-tree copy still exists, a same-named user plugin is shadowed by it
   (bundled providers win on name). It takes effect the moment core drops `plugins/memory/supermemory`.
 
