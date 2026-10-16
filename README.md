@@ -2,11 +2,11 @@
 
 # Supermemory Memory Provider
 
-Semantic long-term memory with profile recall, semantic search, explicit memory tools, and per-turn conversation capture into one document per session per 4-hour window for richer profiles.
+Semantic long-term memory on Supermemory's v5 namespace API: profile recall, semantic search, explicit memory tools, and per-turn conversation capture into one document per conversation.
 
 ## Requirements
 
-- `pip install supermemory`
+- The official SDK, `supermemory>=5.0.0,<6` (declared in `pyproject.toml`; Hermes installs it with the plugin)
 - Hosted: API key from [console.supermemory.ai/keys](https://console.supermemory.ai/keys?create=true)
 - Self-hosted: a running [Supermemory local](https://supermemory.ai/docs/self-hosting/overview) server and the API key it prints on first boot
 
@@ -51,14 +51,14 @@ Config file: `$HERMES_HOME/supermemory.json`
 | Key | Default | Description |
 |-----|---------|-------------|
 | `base_url` | `https://api.supermemory.ai` | API endpoint for hosted or self-hosted Supermemory. Takes priority over `SUPERMEMORY_BASE_URL`. |
-| `container_tag` | `hermes` | Container tag used for search and writes. Supports `{identity}` template for profile-scoped tags (e.g. `hermes-{identity}` → `hermes-coder`). |
+| `container_tag` | `hermes` | The Supermemory namespace used for search and writes. Supports `{identity}` template for profile-scoped tags (e.g. `hermes-{identity}` → `hermes-coder`). |
 | `auto_recall` | `true` | Inject relevant memory context before turns |
 | `auto_capture` | `true` | Store cleaned user-assistant turns after each response |
-| `max_recall_results` | `10` | Max recalled items to format into context |
-| `profile_frequency` | `50` | Include profile facts on first turn and every N turns |
+| `max_recall_results` | `10` | Max search results recalled with the profile (1-20) |
 | `capture_mode` | `all` | Skip tiny or trivial turns by default |
-| `search_mode` | `hybrid` | Search mode: `hybrid` (profile + memories), `memories` (memories only), `documents` (documents only) |
-| `entity_context` | built-in default | Extraction guidance passed to Supermemory |
+| `search_mode` | `hybrid` | Search mode: `hybrid`, `memories` (memories only), `chunks` (document excerpts only; `documents` is accepted as before) |
+| `entity_context` | built-in default | Extraction guidance, sent as the namespace's `supportingContext` with every write |
+| `dreaming` | `dynamic` | Supermemory's processing mode, sent with every write: `dynamic` groups related documents so memories form from coherent context; `instant` processes each document right away (billed as one extra operation per document) |
 | `api_timeout` | `5.0` | Timeout for SDK requests |
 
 ### Environment Variables
@@ -67,7 +67,7 @@ Config file: `$HERMES_HOME/supermemory.json`
 |----------|-------------|
 | `SUPERMEMORY_API_KEY` | API key (required) |
 | `SUPERMEMORY_BASE_URL` | Compatibility fallback for the API endpoint when `base_url` is not configured |
-| `SUPERMEMORY_CONTAINER_TAG` | Override container tag (takes priority over config file) |
+| `SUPERMEMORY_CONTAINER_TAG` | Override the container tag / namespace (takes priority over config file) |
 
 Base URL precedence is `supermemory.json` → `SUPERMEMORY_BASE_URL` →
 `https://api.supermemory.ai`. Hermes resolves it once and uses the same endpoint
@@ -82,7 +82,8 @@ Kebab-case names are registered for the agent; snake_case aliases remain support
 | `supermemory-save` | `supermemory_store` | Store an explicit memory |
 | `supermemory-search` | `supermemory_search` | Search memories by semantic similarity |
 | `supermemory-forget` | `supermemory_forget` | Forget a memory by ID or best-match query |
-| `supermemory-profile` | `supermemory_profile` | Retrieve persistent profile and recent context |
+| `supermemory-profile` | `supermemory_profile` | Retrieve the user's profile (markdown) |
+| `supermemory-read-document` | `supermemory_read_document` | Read a stored document (e.g. a past conversation) by the `document_id` from search results, paged by `offset` |
 
 ## Source attribution
 
@@ -96,11 +97,13 @@ Supermemory app, so you can filter, browse, and bulk-manage them per source agen
 
 When enabled, Hermes can:
 
-- prefetch relevant memory context before each turn
-- write each completed user/assistant turn to **one document per session per 4-hour window** (`customId` = `<session>_<date>_b<0-5>`, so the API appends deltas), matching the capture shape of the other Supermemory agent integrations
-- retry failed turn writes on the next turn, session end, `/reset`, or shutdown (at-least-once: if the API accepted a write but the response was lost, the same turn is appended again)
+- before each turn, recall the full profile and the top `max_recall_results` search results for the message (fetched in parallel, each bounded by `api_timeout`; if one fails the other is still used)
+- after each completed turn, write the conversation so far as **one document per conversation** (id `hermes_<session id>`); the whole document is re-sent under the same id, so it is replaced, never duplicated, and stays current while a long session runs
+- skip a write whose content has not changed, and retry a failed one on the next turn, session end, `/reset`, or shutdown; a refused write is logged and never breaks the turn
+- store messages as given (only the plugin's own recalled `<supermemory-context>` block and inline base64 images are left out)
+- copy built-in `memory` tool additions into Supermemory
 - route every SDK and probe request through the configured hosted or self-hosted endpoint
-- expose explicit tools for search, store, forget, and profile access
+- expose explicit tools for search, store, forget, profile, and reading documents
 
 
 ## Profile-Scoped Containers
@@ -129,10 +132,24 @@ For advanced setups (e.g. OpenClaw-style multi-workspace), you can enable custom
 ```
 
 When enabled:
-- `supermemory-search`, `supermemory-save`, `supermemory-forget`, and `supermemory-profile` accept an optional `container_tag` parameter
+- every tool accepts an optional `container_tag` parameter (each container is its own namespace)
 - The tag must be in the whitelist: primary container + `custom_containers`
 - Automatic operations (turn capture, prefetch, memory write mirroring) always use the **primary** container only
 - Custom container instructions are injected into the system prompt
+
+## Upgrading from 1.x
+
+2.0 moves the plugin from the 3.x SDK (container tags) to the 5.x SDK and Supermemory's v5 namespace API.
+
+- **Data:** reads and writes go to the namespace named by `container_tag` (default `hermes`). Memories written by 1.x
+  under container tags are not migrated by the plugin.
+- **Capture:** one document per conversation, replaced after every turn, instead of one appended document per session per
+  4-hour window.
+- **Recall:** the full markdown profile plus the top search results on every turn. `profile_frequency` is gone.
+- **Tools:** new `supermemory-read-document` / `supermemory_read_document`. `supermemory_profile` no longer takes a
+  `query`, and search results carry a `document_id`.
+- **Settings:** `search_mode: documents` is now `chunks` (the old value still works); new `dreaming` (default `dynamic`, or `instant`). Everything else in
+  `supermemory.json` and the environment is read as before.
 
 ## Support
 
