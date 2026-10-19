@@ -51,7 +51,7 @@ Config file: `$HERMES_HOME/supermemory.json`
 | Key | Default | Description |
 |-----|---------|-------------|
 | `base_url` | `https://api.supermemory.ai` | API endpoint for hosted or self-hosted Supermemory. Takes priority over `SUPERMEMORY_BASE_URL`. |
-| `container_tag` | `hermes` | Container tag used for search and writes. Supports `{identity}` template for profile-scoped tags (e.g. `hermes-{identity}` → `hermes-coder`). |
+| `container_tag` | `hermes` | Container tag used for search and writes. Supports `{identity}` template for profile-scoped tags (e.g. `hermes-{identity}` → `hermes-coder`). Letters, digits, `_`, `-` and `:` are kept as-is; any other character becomes `_`. |
 | `auto_recall` | `true` | Inject relevant memory context before turns |
 | `auto_capture` | `true` | Store cleaned user-assistant turns after each response |
 | `max_recall_results` | `10` | Max recalled items to format into context |
@@ -60,6 +60,10 @@ Config file: `$HERMES_HOME/supermemory.json`
 | `search_mode` | `hybrid` | Search mode: `hybrid` (profile + memories), `memories` (memories only), `documents` (documents only) |
 | `entity_context` | built-in default | Extraction guidance passed to Supermemory |
 | `api_timeout` | `5.0` | Timeout for SDK requests |
+
+### Upgrading from 1.0.1
+
+Up to 1.0.1 the plugin rewrote `-` and `:` in container tags to `_` (and collapsed or trimmed underscores), so a tag like `hermes-{identity}` or `my-project` was read and written as `hermes_coder` or `my_project`. From 1.0.2 tags reach Supermemory unchanged. If you used such a tag, memories the plugin saved before the upgrade live under the underscore name. To keep using them, either set that name explicitly (e.g. `"container_tag": "hermes_coder"`), or merge it into the new tag from the namespaces page in the Supermemory console.
 
 ### Environment Variables
 

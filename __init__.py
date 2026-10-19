@@ -54,8 +54,9 @@ def _quietly(fn: Callable[[], Any], fail_msg: str = "", *args: Any, level: int =
         return default
 
 
+# Keeps exactly the API's containerTag charset, so a tag the API accepts reaches it unchanged.
 def _sanitize_tag(raw: str) -> str:
-    return re.sub(r"_+", "_", re.sub(r"[^a-zA-Z0-9_]", "_", raw or "")).strip("_") or _DEFAULT_CONTAINER_TAG
+    return "_".join(part for part in re.split(r"[^a-zA-Z0-9_:-]+", raw or "") if part) or _DEFAULT_CONTAINER_TAG
 
 
 def _resolve_base_url(config_value: Any = "") -> str:
