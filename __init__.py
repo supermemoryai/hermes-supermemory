@@ -410,12 +410,9 @@ class SupermemoryMemoryProvider(MemoryProvider):
         marker = Path(self._hermes_home) / ".supermemory_legacy_tags_warned"
         if not renamed or marker.exists():
             return
-        logger.warning(
-            "Supermemory now uses container tags exactly as configured. If you used plugin 1.0.1 or earlier, it rewrote "
-            "them, so anything it saved is under the old name: %s. To keep using that data, put the old name in "
-            "supermemory.json (container_tag or custom_containers). Or, once the new tag exists (after its first save), an org admin can merge the old tag into it "
-            "from the Namespaces page at console.supermemory.ai or with POST /v3/container-tags/merge; the merge deletes the old tag.",
-            ", ".join(f"{old} -> {new}" for old, new in renamed))
+        logger.warning("Memories saved by hermes-supermemory 1.0.1 are under the old tag (old -> new): %s. To keep them, set the old name "
+                       "in supermemory.json, or have an org admin merge it into the new tag from Namespaces at console.supermemory.ai "
+                       "after your first save.", ", ".join(f"{old} -> {new}" for old, new in renamed))
         _quietly(marker.touch, "Failed to write %s", marker)
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:

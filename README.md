@@ -51,7 +51,7 @@ Config file: `$HERMES_HOME/supermemory.json`
 | Key | Default | Description |
 |-----|---------|-------------|
 | `base_url` | `https://api.supermemory.ai` | API endpoint for hosted or self-hosted Supermemory. Takes priority over `SUPERMEMORY_BASE_URL`. |
-| `container_tag` | `hermes` | Container tag used for search and writes. Supports `{identity}` template for profile-scoped tags (e.g. `hermes-{identity}` → `hermes-coder`). Letters, digits, `_`, `-` and `:` are kept as-is; any other run of characters becomes one `_`. Tags over Supermemory's 100-character limit are cut to 91 characters plus `_` and the first 8 hex characters of the full tag's SHA-256, so long tags that share a prefix still map to different tags. |
+| `container_tag` | `hermes` | Container tag used for search and writes. Supports `{identity}` template for profile-scoped tags (e.g. `hermes-{identity}` → `hermes-coder`). Letters, digits, `_`, `-` and `:` are kept; other characters become `_`. Tags over 100 characters are shortened to 100, ending in `_` and an 8-character hash of the full tag so they stay distinct. |
 | `auto_recall` | `true` | Inject relevant memory context before turns |
 | `auto_capture` | `true` | Store cleaned user-assistant turns after each response |
 | `max_recall_results` | `10` | Max recalled items to format into context |
@@ -63,10 +63,9 @@ Config file: `$HERMES_HOME/supermemory.json`
 
 ### Upgrading from 1.0.1
 
-Up to 1.0.1 the plugin rewrote `-` and `:` in container tags to `_` (and collapsed or trimmed underscores), so a tag like `hermes-{identity}` or `my-project` was read and written as `hermes_coder` or `my_project`. From 1.0.2 tags reach Supermemory unchanged. If you used such a tag, memories the plugin saved before the upgrade live under the underscore name, and the plugin logs a one-time warning naming each old and new tag. Nothing is moved or deleted for you. To get the old data back, either:
+1.0.1 changed `-` and `:` in tags to `_`, so `hermes-coder` was saved as `hermes_coder`. From 1.0.2 tags are kept as written, so memories saved before the upgrade stay under the old name. The plugin logs the old and new name once.
 
-- keep using the underscore name by setting it explicitly in `supermemory.json` (e.g. `"container_tag": "hermes_coder"`, or the underscore form in `custom_containers`), or
-- after the first save on 1.0.2 has created the new tag, have an org admin or owner merge the underscore tag into it, from the Namespaces page at [console.supermemory.ai](https://console.supermemory.ai) or with `POST /v3/container-tags/merge` (`{"containerTags": ["hermes_coder", "hermes-coder"], "targetContainerTag": "hermes-coder"}`). Both tags must already exist. The merge runs in the background, is refused while an ingest or another merge is in progress, and deletes the old tag when it finishes.
+To keep those memories, either set the old name in `supermemory.json` (`"container_tag": "hermes_coder"`), or have an org admin merge `hermes_coder` into `hermes-coder` from the Namespaces page at console.supermemory.ai after your first save on 1.0.2.
 
 ### Environment Variables
 
