@@ -63,7 +63,10 @@ Config file: `$HERMES_HOME/supermemory.json`
 
 ### Upgrading from 1.0.1
 
-Up to 1.0.1 the plugin rewrote `-` and `:` in container tags to `_` (and collapsed or trimmed underscores), so a tag like `hermes-{identity}` or `my-project` was read and written as `hermes_coder` or `my_project`. From 1.0.2 tags reach Supermemory unchanged. If you used such a tag, memories the plugin saved before the upgrade live under the underscore name. To keep using them, either set that name explicitly (e.g. `"container_tag": "hermes_coder"`), or merge it into the new tag from the namespaces page in the Supermemory console.
+Up to 1.0.1 the plugin rewrote `-` and `:` in container tags to `_` (and collapsed or trimmed underscores), so a tag like `hermes-{identity}` or `my-project` was read and written as `hermes_coder` or `my_project`. From 1.0.2 tags reach Supermemory unchanged. If you used such a tag, memories the plugin saved before the upgrade live under the underscore name, and the plugin logs a one-time warning naming each old and new tag. Nothing is moved or deleted for you. To get the old data back, either:
+
+- keep using the underscore name by setting it explicitly in `supermemory.json` (e.g. `"container_tag": "hermes_coder"`, or the underscore form in `custom_containers`), or
+- after the first save on 1.0.2 has created the new tag, have an org admin or owner merge the underscore tag into it, from the Namespaces page at [console.supermemory.ai](https://console.supermemory.ai) or with `POST /v3/container-tags/merge` (`{"containerTags": ["hermes_coder", "hermes-coder"], "targetContainerTag": "hermes-coder"}`). Both tags must already exist. The merge runs in the background, is refused while an ingest or another merge is in progress, and deletes the old tag when it finishes.
 
 ### Environment Variables
 

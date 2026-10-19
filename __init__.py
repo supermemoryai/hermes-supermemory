@@ -59,6 +59,11 @@ def _sanitize_tag(raw: str) -> str:
     return "_".join(part for part in re.split(r"[^a-zA-Z0-9_:-]+", raw or "") if part) or _DEFAULT_CONTAINER_TAG
 
 
+# The 1.0.1 sanitizer, kept only to name the container that version wrote to.
+def _legacy_tag(tag: str) -> str:
+    return re.sub(r"_+", "_", re.sub(r"[^a-zA-Z0-9_]", "_", tag)).strip("_") or _DEFAULT_CONTAINER_TAG
+
+
 def _resolve_base_url(config_value: Any = "") -> str:
     """config > SUPERMEMORY_BASE_URL (profile-scoped) > default (self-hosted support)."""
     raw = str(config_value or "").strip() or (get_secret("SUPERMEMORY_BASE_URL", "") or "").strip()
@@ -390,6 +395,23 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._client = _quietly(lambda: _build_client(self._api_key, config, self._container_tag),
                                 "Supermemory initialization failed", level=logging.WARNING) if self._api_key else None
         self._active = self._client is not None
+        if self._active:
+            self._warn_legacy_tags_once()
+
+    # Data saved by 1.0.1 sits under its rewritten tag; a marker file in HERMES_HOME keeps this to one warning per install.
+    def _warn_legacy_tags_once(self) -> None:
+        tags = [self._container_tag] + (self._custom_containers if self._enable_custom_containers else [])
+        renamed = {tag: old for tag in tags if (old := _legacy_tag(tag)) != tag}
+        marker = Path(self._hermes_home) / ".supermemory_legacy_tags_warned"
+        if not renamed or marker.exists():
+            return
+        logger.warning(
+            "Supermemory now uses container tags exactly as configured. If you used plugin 1.0.1 or earlier, it rewrote "
+            "them, so anything it saved is under the old name: %s. To keep using that data, put the old name in "
+            "supermemory.json (container_tag or custom_containers). Or, once the new tag exists (after its first save), an org admin can merge the old tag into it "
+            "from the Namespaces page at console.supermemory.ai or with POST /v3/container-tags/merge; the merge deletes the old tag.",
+            ", ".join(f"{old} -> {tag}" for tag, old in renamed.items()))
+        _quietly(marker.touch, "Failed to write %s", marker)
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         self._turn_count = max(turn_number, 0)
