@@ -2,7 +2,7 @@
 
 # Supermemory Memory Provider
 
-Semantic long-term memory on Supermemory's v5 namespace API: profile recall, semantic search, explicit memory tools, and per-turn conversation capture into one document per conversation.
+Semantic long-term memory with profile recall, semantic search, explicit memory tools, and per-turn conversation capture into one document per conversation.
 
 ## Requirements
 
@@ -51,14 +51,15 @@ Config file: `$HERMES_HOME/supermemory.json`
 | Key | Default | Description |
 |-----|---------|-------------|
 | `base_url` | `https://api.supermemory.ai` | API endpoint for hosted or self-hosted Supermemory. Takes priority over `SUPERMEMORY_BASE_URL`. |
-| `container_tag` | `hermes` | Container tag used for search and writes. Supports `{identity}` template for profile-scoped tags (e.g. `hermes-{identity}` → `hermes-coder`). Letters, digits, `_`, `-` and `:` are kept; other characters become `_`. Tags over 100 characters are shortened to 100, ending in `_` and an 8-character hash of the full tag so they stay distinct. |
+| `container_tag` | `hermes` | Container tag (namespace) used for search and writes. Supports `{identity}` template for profile-scoped tags (e.g. `hermes-{identity}` → `hermes-coder`). Letters, digits, `_`, `-` and `:` are kept; other characters become `_`. Tags over 100 characters are shortened to 100, ending in `_` and an 8-character hash of the full tag so they stay distinct. |
 | `auto_recall` | `true` | Inject relevant memory context before turns |
 | `auto_capture` | `true` | Store cleaned user-assistant turns after each response |
 | `max_recall_results` | `10` | Max search results recalled with the profile (1-20) |
+| `profile_frequency` | `50` | Include profile facts on the first turn and every N turns |
 | `capture_mode` | `all` | Skip tiny or trivial turns by default |
 | `search_mode` | `hybrid` | Search mode: `hybrid`, `memories` (memories only), `chunks` (document excerpts only; `documents` is accepted as before) |
-| `entity_context` | built-in default | Extraction guidance, sent as the namespace's `supportingContext` with every write |
-| `dreaming` | `dynamic` | Supermemory's processing mode, sent with every write: `dynamic` groups related documents so memories form from coherent context; `instant` processes each document right away (billed as one extra operation per document) |
+| `entity_context` | built-in default | Extraction guidance passed to Supermemory |
+| `dreaming` | `dynamic` | `dynamic` groups related conversations before forming memories; `instant` processes each one right away (billed as one extra operation) |
 | `api_timeout` | `5.0` | Timeout for SDK requests |
 
 ### Upgrading from 1.0.1
@@ -88,8 +89,8 @@ Kebab-case names are registered for the agent; snake_case aliases remain support
 | `supermemory-save` | `supermemory_store` | Store an explicit memory |
 | `supermemory-search` | `supermemory_search` | Search memories by semantic similarity |
 | `supermemory-forget` | `supermemory_forget` | Forget a memory by ID or best-match query |
-| `supermemory-profile` | `supermemory_profile` | Retrieve the user's profile (markdown) |
-| `supermemory-read-document` | `supermemory_read_document` | Read a stored document (e.g. a past conversation) by the `document_id` from search results, paged by `offset` |
+| `supermemory-profile` | `supermemory_profile` | Retrieve the user's profile, optionally with memories matching a `query` |
+| `supermemory-read-document` | `supermemory_read_document` | Read a stored document, such as a past conversation, by the `document_id` from search results |
 
 ## Source attribution
 
@@ -103,9 +104,9 @@ Supermemory app, so you can filter, browse, and bulk-manage them per source agen
 
 When enabled, Hermes can:
 
-- before each turn, recall the full profile and the top `max_recall_results` search results for the message (fetched in parallel, each bounded by `api_timeout`; if one fails the other is still used)
-- after each completed turn, write the conversation so far as **one document per conversation** (id `hermes_<session id>`); the whole document is re-sent under the same id, so it is replaced, never duplicated, and stays current while a long session runs
-- skip a write whose content has not changed, and retry a failed one on the next turn, session end, `/reset`, or shutdown; a refused write is logged and never breaks the turn
+- before each turn, recall relevant memories, plus profile facts on the first turn and every `profile_frequency` turns
+- after each completed turn, save the conversation so far as **one document per conversation**, rewritten in full, so undo, edits and context compaction never store it twice
+- skip a save when nothing changed, and retry a failed one later (up to 50 conversations); a failed save is logged and never breaks the turn
 - store messages as given (only the plugin's own recalled `<supermemory-context>` block and inline base64 images are left out)
 - copy built-in `memory` tool additions into Supermemory
 - route every SDK and probe request through the configured hosted or self-hosted endpoint
@@ -145,17 +146,9 @@ When enabled:
 
 ## Upgrading from 1.x
 
-2.0 moves the plugin from the 3.x SDK (container tags) to the 5.x SDK and Supermemory's v5 namespace API.
-
-- **Data:** reads and writes go to the namespace named by `container_tag` (default `hermes`). Memories written by 1.x
-  under container tags are not migrated by the plugin.
-- **Capture:** one document per conversation, replaced after every turn, instead of one appended document per session per
-  4-hour window.
-- **Recall:** the full markdown profile plus the top search results on every turn. `profile_frequency` is gone.
-- **Tools:** new `supermemory-read-document` / `supermemory_read_document`. `supermemory_profile` no longer takes a
-  `query`, and search results carry a `document_id`.
-- **Settings:** `search_mode: documents` is now `chunks` (the old value still works); new `dreaming` (default `dynamic`, or `instant`). Everything else in
-  `supermemory.json` and the environment is read as before.
+- Your memories stay searchable under the same `container_tag`. Nothing needs migrating.
+- New conversations are saved as one document each instead of one per 4-hour window. A conversation that was open during the upgrade keeps its earlier turns where 1.x saved them, and only new turns go into the new document.
+- `search_mode: documents` is now called `chunks`; the old value still works.
 
 ## Support
 
