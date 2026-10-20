@@ -27,6 +27,7 @@ except ImportError:  # older Hermes: plain threads
 logger = logging.getLogger(__name__)
 
 _DEFAULT_CONTAINER_TAG = "hermes"
+_MAX_TAG_LEN = 100
 _VALID_SEARCH_MODES = ("hybrid", "memories", "chunks")
 _VALID_DREAMING = ("dynamic", "instant")
 _SDK_REQUIREMENT = "supermemory>=5.0.0,<6"
@@ -62,7 +63,18 @@ def _quietly(fn: Callable[[], Any], fail_msg: str = "", *args: Any, level: int =
         return default
 
 
+# The API rejects ids over 100 chars; a hash of the full id keeps long ones that share a prefix distinct.
+def _cap_tag(tag: str) -> str:
+    return tag if len(tag) <= _MAX_TAG_LEN else f"{tag[:_MAX_TAG_LEN - 9]}_{hashlib.sha256(tag.encode()).hexdigest()[:8]}"
+
+
+# Keeps exactly the API's containerTag charset, so a tag the API accepts reaches it unchanged.
 def _sanitize_tag(raw: str) -> str:
+    return _cap_tag("_".join(part for part in re.split(r"[^a-zA-Z0-9_:-]+", raw or "") if part) or _DEFAULT_CONTAINER_TAG)
+
+
+# The 1.0.1 sanitizer, kept only to name the container that version wrote to.
+def _legacy_tag(raw: str) -> str:
     return re.sub(r"_+", "_", re.sub(r"[^a-zA-Z0-9_]", "_", raw or "")).strip("_") or _DEFAULT_CONTAINER_TAG
 
 
@@ -91,9 +103,7 @@ def _search_mode(value: Any) -> str:
     return mode if mode in _VALID_SEARCH_MODES else "hybrid"
 
 
-# config key -> (default, normalizer applied to the raw/merged value). Order = supermemory.json layout.
-# container_tag is kept raw here: {identity} templates are resolved in initialize(), and
-# _sanitize_tag runs AFTER that resolution. custom_containers, by contrast, are sanitized on load.
+# config key -> (default, normalizer). Tags stay raw here and are sanitized once applied, after {identity} expansion.
 _CONFIG_SPEC: Dict[str, tuple] = {
     "container_tag": (_DEFAULT_CONTAINER_TAG, lambda v: str(v).strip() or _DEFAULT_CONTAINER_TAG),
     "auto_recall": (True, lambda v: _as_bool(v, True)),
@@ -106,7 +116,7 @@ _CONFIG_SPEC: Dict[str, tuple] = {
     "api_timeout": (5.0, lambda v: _clamp_number(v, 5.0, 0.5, 15.0, float)),
     "base_url": ("", lambda v: str(v or "").strip()),
     "enable_custom_container_tags": (False, lambda v: _as_bool(v, False)),
-    "custom_containers": ([], lambda v: [_sanitize_tag(str(t)) for t in v if t] if isinstance(v, list) else []),
+    "custom_containers": ([], lambda v: [str(t) for t in v if t] if isinstance(v, list) else []),
     "custom_container_instructions": ("", lambda v: str(v).strip()),
 }
 
@@ -314,17 +324,15 @@ def _build_client(api_key: str, config: dict, container_tag: str) -> _Supermemor
                               search_mode=config["search_mode"], base_url=_resolve_base_url(config["base_url"]))
 
 
-def _resolve_container_tag(config_tag: str, identity: str) -> str:
-    """SUPERMEMORY_CONTAINER_TAG (profile-scoped) > config > default; {identity} expands to the agent
-    identity, then sanitize. The container is the data partition, so it must never be borrowed from
-    the default profile's environ under multiplexing."""
+def _expand_container_tag(config_tag: str, identity: str) -> str:
+    """SUPERMEMORY_CONTAINER_TAG (profile-scoped, never the default profile's environ) > config > default, {identity} expanded."""
     raw_tag = (get_secret("SUPERMEMORY_CONTAINER_TAG", "") or "").strip() or config_tag
-    return _sanitize_tag(raw_tag.replace("{identity}", identity))
+    return raw_tag.replace("{identity}", identity)
 
 
 def _probe_supermemory_connection(api_key: str, hermes_home: str, *, identity: str = "default") -> dict:
     config = _load_supermemory_config(hermes_home)
-    status = {"ok": False, "error": "", "profile_facts": 0, "container_tag": _resolve_container_tag(config["container_tag"], identity),
+    status = {"ok": False, "error": "", "profile_facts": 0, "container_tag": _sanitize_tag(_expand_container_tag(config["container_tag"], identity)),
               "auto_recall": bool(config["auto_recall"]), "auto_capture": bool(config["auto_capture"])}
     if not (api_key or "").strip():
         return {**status, "error": "SUPERMEMORY_API_KEY not set"}
@@ -391,8 +399,9 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
     def _apply_config(self, config: dict) -> None:
         for key in ("auto_recall", "auto_capture", "max_recall_results", "capture_mode", "search_mode", "entity_context",
-                    "dreaming", "api_timeout", "custom_containers", "custom_container_instructions"):
+                    "dreaming", "api_timeout", "custom_container_instructions"):
             setattr(self, f"_{key}", config[key])
+        self._custom_containers = [_sanitize_tag(t) for t in config["custom_containers"]]
         self._base_url, self._enable_custom_containers = _resolve_base_url(config["base_url"]), config["enable_custom_container_tags"]
         self._allowed_containers: List[str] = [self._container_tag] + list(self._custom_containers)
 
@@ -449,12 +458,27 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._session_id, self._turns, self._captured_digest = session_id, [], None
         config = _load_supermemory_config(self._hermes_home)
         self._api_key = get_secret("SUPERMEMORY_API_KEY", "") or ""
-        self._container_tag = _resolve_container_tag(config["container_tag"], kwargs.get("agent_identity", "default"))
+        raw_tag = _expand_container_tag(config["container_tag"], kwargs.get("agent_identity", "default"))
+        self._container_tag = _sanitize_tag(raw_tag)
         self._apply_config(config)
         self._write_enabled = kwargs.get("agent_context", "") not in {"cron", "flush", "subagent"}
         self._client = _quietly(lambda: _build_client(self._api_key, config, self._container_tag),
                                 "Supermemory initialization failed", level=logging.WARNING) if self._api_key else None
         self._active = self._client is not None
+        if self._active:
+            self._warn_legacy_tags_once([raw_tag] + (config["custom_containers"] if self._enable_custom_containers else []))
+
+    # Data saved by 1.0.1 sits under its rewritten tag; a marker file in HERMES_HOME keeps this to one warning per install.
+    def _warn_legacy_tags_once(self, raw_tags: List[str]) -> None:
+        pairs = {(_legacy_tag(raw), _sanitize_tag(raw)) for raw in raw_tags}
+        renamed = sorted((old, new) for old, new in pairs if old != new and len(old) <= _MAX_TAG_LEN)
+        marker = Path(self._hermes_home) / ".supermemory_legacy_tags_warned"
+        if not renamed or marker.exists():
+            return
+        logger.warning("Memories saved by hermes-supermemory 1.0.1 are under the old tag (old -> new): %s. To keep them, set the old name "
+                       "in supermemory.json, or have an org admin merge it into the new tag from Namespaces at console.supermemory.ai "
+                       "after your first save.", ", ".join(f"{old} -> {new}" for old, new in renamed))
+        _quietly(marker.touch, "Failed to write %s", marker)
 
     def system_prompt_block(self) -> str:
         lines = ["# Supermemory", f"Active. Container: {self._container_tag}.",

@@ -51,7 +51,7 @@ Config file: `$HERMES_HOME/supermemory.json`
 | Key | Default | Description |
 |-----|---------|-------------|
 | `base_url` | `https://api.supermemory.ai` | API endpoint for hosted or self-hosted Supermemory. Takes priority over `SUPERMEMORY_BASE_URL`. |
-| `container_tag` | `hermes` | The Supermemory namespace used for search and writes. Supports `{identity}` template for profile-scoped tags (e.g. `hermes-{identity}` → `hermes-coder`). |
+| `container_tag` | `hermes` | Container tag used for search and writes. Supports `{identity}` template for profile-scoped tags (e.g. `hermes-{identity}` → `hermes-coder`). Letters, digits, `_`, `-` and `:` are kept; other characters become `_`. Tags over 100 characters are shortened to 100, ending in `_` and an 8-character hash of the full tag so they stay distinct. |
 | `auto_recall` | `true` | Inject relevant memory context before turns |
 | `auto_capture` | `true` | Store cleaned user-assistant turns after each response |
 | `max_recall_results` | `10` | Max search results recalled with the profile (1-20) |
@@ -60,6 +60,12 @@ Config file: `$HERMES_HOME/supermemory.json`
 | `entity_context` | built-in default | Extraction guidance, sent as the namespace's `supportingContext` with every write |
 | `dreaming` | `dynamic` | Supermemory's processing mode, sent with every write: `dynamic` groups related documents so memories form from coherent context; `instant` processes each document right away (billed as one extra operation per document) |
 | `api_timeout` | `5.0` | Timeout for SDK requests |
+
+### Upgrading from 1.0.1
+
+1.0.1 changed `-` and `:` in tags to `_`, so `hermes-coder` was saved as `hermes_coder`. From 1.0.2 tags are kept as written, so memories saved before the upgrade stay under the old name. The plugin logs the old and new name once.
+
+To keep those memories, either set the old name in `supermemory.json` (`"container_tag": "hermes_coder"`), or have an org admin merge `hermes_coder` into `hermes-coder` from the Namespaces page at console.supermemory.ai after your first save on 1.0.2.
 
 ### Environment Variables
 
