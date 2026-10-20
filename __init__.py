@@ -179,11 +179,37 @@ def _clean_text_for_capture(text: str) -> str:
     return _DATA_URI_RE.sub("[image]", _INJECTED_BLOCK_RE.sub("", text or "")).strip()
 
 
+def _mem_field(item: Any, name: str, default: Any = None) -> Any:
+    """SDK hits arrive as objects, but degrade to dicts after ``model_dump`` — read both."""
+    return item.get(name, default) if isinstance(item, dict) else getattr(item, name, default)
+
+
+def _memory_text(item: Any) -> str:
+    """Hybrid search returns TWO hit kinds: memory-level (text in ``memory``) and chunk-level
+    (``memory`` null, text in ``chunk``/``context``). Reading only ``memory`` renders every
+    chunk hit as an empty string, which silently blanks tool results and prefetch context."""
+    for key in ("memory", "chunk", "context"):
+        val = _mem_field(item, key)
+        if isinstance(val, str) and val.strip():
+            return val
+    chunks = _mem_field(item, "chunks")
+    if isinstance(chunks, list):
+        return " ".join(str(c) for c in chunks if c)
+    return ""
+
+
 def _memory_fields(item: Any, *keys: str) -> dict:
     """Pick SDK result attrs into a plain dict; ``updated_at`` also accepts camelCase ``updatedAt``."""
     defaults = {"id": "", "memory": "", "similarity": None, "metadata": None}
-    return {k: getattr(item, "updated_at", None) or getattr(item, "updatedAt", None) if k == "updated_at" else getattr(item, k, defaults[k])
-            for k in keys}
+
+    def _one(k: str) -> Any:
+        if k == "memory":
+            return _memory_text(item)
+        if k == "updated_at":
+            return _mem_field(item, "updated_at") or _mem_field(item, "updatedAt")
+        return _mem_field(item, k, defaults[k])
+
+    return {k: _one(k) for k in keys}
 
 
 class _SupermemoryClient:
@@ -221,7 +247,7 @@ class _SupermemoryClient:
         kwargs: dict[str, Any] = {"q": query, "container_tag": container_tag or self._container_tag, "limit": limit,
                                   **({"search_mode": mode} if mode in _VALID_SEARCH_MODES else {})}
         response = self._client.search.memories(**kwargs)
-        return [{**_memory_fields(item, "id", "memory", "similarity", "updated_at", "metadata"), "memory": getattr(item, "memory", "") or ""}
+        return [_memory_fields(item, "id", "memory", "similarity", "updated_at", "metadata")
                 for item in (getattr(response, "results", None) or [])]
 
     def get_profile(self, query: Optional[str] = None, *, container_tag: Optional[str] = None) -> dict:
