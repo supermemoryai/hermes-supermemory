@@ -73,8 +73,11 @@ class FakeAPI:
             if doc_id not in self.docs:
                 return httpx.Response(404, json={"error": "Document not found"})
             return httpx.Response(200, json={"type": "text", "metadata": {}, "system": {"status": "done"}, **self.docs[doc_id]})
-        if "forget" in path:
-            return httpx.Response(200, json={"count": len(body.get("ids") or []), "errors": [], "matches": []})
+        if method == "DELETE" and path.endswith("/memories"):
+            ids = body.get("ids") or []
+            known = [i for i in ids if any(r["id"] == i for r in self.results)]
+            return httpx.Response(200, json={"count": len(known), "matches": [{"id": i, "memory": "x"} for i in known],
+                                             "errors": [{"id": i, "error": "Memory not found"} for i in ids if i not in known]})
         return httpx.Response(200, json={})
 
     def writes(self):
@@ -266,6 +269,9 @@ def test_tools_and_kebab_aliases(api, tmp_path):
     assert api.requests[-1]["body"] == {"ids": ["m1"]} and "/ns/hermes/" in api.requests[-1]["path"]
     by_query = json.loads(provider.handle_tool_call("supermemory-forget", {"query": "email"}))
     assert by_query["success"] is True and by_query["id"] == "m1"
+    assert api.requests[-2]["body"]["searchMode"] == "memories"
+    missing = json.loads(provider.handle_tool_call("supermemory_forget", {"id": "gone"}))
+    assert missing == {"error": "Forget failed: Memory not found"}
 
 
 def test_read_document_pages_and_encodes_ids(api, tmp_path):
@@ -493,3 +499,42 @@ def test_setup_reads_the_key_through_hermes_and_leaves_the_environment_alone(api
     assert "SUPERMEMORY_API_KEY" in seen and dict(os.environ) == before
     assert api.requests[-1]["headers"]["authorization"] == "Bearer scoped-key"
     assert "os.environ" not in inspect.getsource(sm)
+
+
+def test_compaction_keeping_head_and_tail_stores_each_turn_once(api, tmp_path):
+    provider = make_provider(tmp_path)
+    three = transcript(("Book the usual table", "Booked."), ("And a cab at 7.", "Cab booked."), ("Make it 8 instead.", "Moved to 8."))
+    provider.sync_turn("Make it 8 instead.", "Moved to 8.", messages=three)
+    provider.on_session_switch("session-1", reason="compression")
+    compacted = (transcript(("Book the usual table", "Booked."))
+                 + [{"role": "user", "content": SUMMARY, "_compressed_summary": True}]
+                 + transcript(("Make it 8 instead.", "Moved to 8."), ("Thanks", "Any time.")))
+    provider.sync_turn("Thanks", "Any time.", messages=compacted)
+    turn4 = "[role: user]\nThanks\n[user:end]\n[role: assistant]\nAny time.\n[assistant:end]"
+    assert api.captures() == {"hermes_session-1": "\n\n".join((TURN1, TURN2, TURN3, turn4))}
+
+
+def test_failed_document_read_after_compaction_defers_the_write(api, tmp_path):
+    make_provider(tmp_path).sync_turn("And a cab at 7.", "Cab booked.", messages=transcript(
+        ("Book the usual table", "Booked."), ("And a cab at 7.", "Cab booked.")))
+    compacted = [{"role": "user", "content": SUMMARY, "_compressed_summary": True}] + transcript(
+        ("And a cab at 7.", "Cab booked."), ("Make it 8 instead.", "Moved to 8."))
+    provider = make_provider(tmp_path)
+    api.failures = [("/document/hermes_session-1", 503)]
+    provider.sync_turn("Make it 8 instead.", "Moved to 8.", messages=compacted)
+    assert api.captures() == {"hermes_session-1": TURN1 + "\n\n" + TURN2}
+    provider.on_session_end(compacted)
+    assert api.captures() == {"hermes_session-1": "\n\n".join((TURN1, TURN2, TURN3))}
+
+
+def test_undo_after_a_failed_write_rewrites_the_shorter_snapshot(api, tmp_path):
+    provider = make_provider(tmp_path)
+    first = transcript(("Book the usual table", "Booked."))
+    provider.sync_turn("Book the usual table", "Booked.", messages=first)
+    api.lose = [True]
+    provider.sync_turn("And a cab at 7.", "Cab booked.", messages=first + transcript(("And a cab at 7.", "Cab booked.")))
+    provider.on_session_switch("session-1", rewound=True)
+    provider.on_session_end(first)
+    provider.on_session_switch("session-2", reset=True)
+    provider.shutdown()
+    assert api.captures() == {"hermes_session-1": TURN1} and provider._pending == {}

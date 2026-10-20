@@ -302,15 +302,21 @@ class _SupermemoryClient:
         return {"id": doc_id, "date": doc.get("date") or (doc.get("metadata") or {}).get("date"), "content": window,
                 "next_offset": end if end < len(content) else None}
 
-    def forget_memory(self, memory_id: str, *, container_tag: Optional[str] = None) -> None:
-        self._client.memories.forget(container_tag or self._container_tag, ids=[memory_id])
+    # V5 answers 200 with per-id errors, so a missing or ineligible id must be read from the body; returns the error or "".
+    def forget_memory(self, memory_id: str, *, container_tag: Optional[str] = None) -> str:
+        result = _as_dict(self._client.memories.forget(container_tag or self._container_tag, ids=[memory_id]))
+        errors = [e.get("error") or "not forgotten" for e in result.get("errors") or [] if e.get("id") == memory_id]
+        if errors or memory_id not in {m.get("id") for m in result.get("matches") or []}:
+            return errors[0] if errors else "memory not found"
+        return ""
 
     def forget_by_query(self, query: str, *, container_tag: Optional[str] = None) -> dict:
-        results = self.search_memories(query, limit=5, container_tag=container_tag)
+        results = self.search_memories(query, limit=5, container_tag=container_tag, search_mode="memories")
         memory_id = results[0].get("id", "") if results else ""
         if not memory_id:
             return {"success": False, "message": "Best matching memory has no id." if results else "No matching memory found to forget."}
-        self.forget_memory(memory_id, container_tag=container_tag)
+        if error := self.forget_memory(memory_id, container_tag=container_tag):
+            return {"success": False, "message": f"Could not forget {memory_id}: {error}", "id": memory_id}
         return {"success": True, "message": f'Forgot: "{(results[0].get("memory") or "")[:100]}"', "id": memory_id}
 
 
@@ -353,10 +359,12 @@ def _turns_from_messages(messages: Optional[list]) -> List[Dict[str, str]]:
     return turns
 
 
-# Turns kept across a compaction reappear at the start of the new transcript; count them once.
+# Compaction keeps the first turns and the latest ones around its summary; both are already in the archive, so count them once.
 def _join_turns(archive: List[Dict[str, str]], turns: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    overlap = next((k for k in range(min(len(archive), len(turns)), 0, -1) if archive[-k:] == turns[:k]), 0)
-    return archive + turns[overlap:]
+    head = next((i for i, (a, t) in enumerate(zip(archive, turns)) if a != t), min(len(archive), len(turns)))
+    rest, room = turns[head:], len(archive) - head
+    tail = next((k for k in range(min(room, len(rest)), 0, -1) if archive[-k:] == rest[:k]), 0)
+    return archive + rest[tail:]
 
 
 def _build_client(api_key: str, config: dict, container_tag: str) -> _SupermemoryClient:
@@ -594,17 +602,25 @@ class SupermemoryMemoryProvider(MemoryProvider):
             return turns
         return turns[next((i for i, t in enumerate(turns) if _format_turn(t["user"], t["assistant"]) not in self._legacy_text), len(turns)):]
 
-    # A provider built after an in-place compaction only sees the kept tail, so it starts from what the document already holds.
-    def _seed_archive(self, messages: Optional[list]) -> None:
+    # A provider built after a compaction only sees what it kept, so it starts from the stored document; False when that read failed.
+    def _seed_archive(self, messages: Optional[list]) -> bool:
         if self._archive or self._captured_digest or not any(isinstance(m, dict) and m.get("_compressed_summary") for m in messages or []):
-            return
-        stored = _quietly(lambda: self._client.read_document(self._doc_id, 0, limit=None)["content"], "Supermemory document read failed") or ""
+            return True
+        try:
+            stored = self._client.read_document(self._doc_id, 0, limit=None)["content"]
+        except self._client._sm.NotFoundError:
+            stored = ""
+        except Exception:
+            logger.warning("Supermemory: could not read %s; its next write waits so earlier turns are not dropped", self._doc_id, exc_info=True)
+            return False
         self._archive = [{"user": u, "assistant": a} for u, a in _STORED_TURN_RE.findall(stored)]
+        return True
 
     def _capture(self, mode: str, messages: Optional[list] = None, *, completed_only: bool = False) -> None:
         with self._capture_lock:
             self._retry_pending(mode)
-            self._seed_archive(messages)
+            if not self._seed_archive(messages):
+                return
             turns = _turns_from_messages(messages)
             if completed_only and turns and not turns[-1]["assistant"]:
                 turns = turns[:-1]  # the transcript can run ahead of the turn being synced
@@ -614,7 +630,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 return
             content = "\n\n".join(_format_turn(t["user"], t["assistant"]) for t in turns)
             digest = hashlib.sha256(content.encode()).hexdigest()
-            if digest == self._captured_digest:
+            if digest == self._captured_digest and self._unsent is None:
                 return
             doc = {"content": content, "metadata": {"type": "conversation", "session_id": self._doc_session, "docId": self._doc_id}}
             if self._write(self._doc_id, doc, mode):
@@ -723,7 +739,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
         tag = self._tool_container_tag(args)  # not echoed in the response
         if not memory_id:
             return self._client.forget_by_query(query, container_tag=tag)
-        self._client.forget_memory(memory_id, container_tag=tag)
+        if error := self._client.forget_memory(memory_id, container_tag=tag):
+            return tool_error(f"Forget failed: {error}")
         return {"forgotten": True, "id": memory_id}
 
     def _tool_profile(self, args: dict) -> dict:
