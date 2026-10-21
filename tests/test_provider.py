@@ -4,7 +4,7 @@ import inspect
 import json
 import os
 import stat
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import unquote
 
 import httpx
@@ -33,7 +33,7 @@ class FakeAPI:
     def __call__(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content) if request.content else None
         path = request.url.raw_path.decode().split("?", 1)[0]
-        self.requests.append({"method": request.method, "path": path, "body": body,
+        self.requests.append({"method": request.method, "path": path, "body": body, "url": str(request.url),
                               "headers": {k.lower(): v for k, v in request.headers.items()}})
         for failure in list(self.failures):
             if path.endswith(failure[0]) or (failure[0] == "/document" and "/document/" in path):
@@ -88,6 +88,26 @@ class FakeAPI:
         return {k: v["content"] for k, v in self.docs.items() if (v.get("metadata") or {}).get("type") == "conversation"}
 
 
+class AppendGateway(FakeAPI):
+    """A backend built for ``capture_writes: append_delta``: a POST to an existing id appends its text, an exact retry
+    (the identical request to the same namespace) is applied once, and PATCH (replacing the stored history) is refused."""
+
+    def __init__(self):
+        super().__init__()
+        self.applied = set()
+
+    def route(self, method, path, body):
+        if "/document/" in path and method == "PATCH":
+            return httpx.Response(403, json={"error": "replacing a conversation is not allowed"})
+        if path.endswith("/document") and method == "POST" and body.get("id"):
+            if (key := (path, json.dumps(body, sort_keys=True))) not in self.applied:
+                self.applied.add(key)
+                old = self.docs.get(body["id"], {}).get("content")
+                self.docs[body["id"]] = {**body, "content": f"{old}\n\n{body['content']}" if old else body["content"]}
+            return httpx.Response(200, json={"id": body["id"], "status": "queued"})
+        return super().route(method, path, body)
+
+
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
     sm._LEGACY_TEXT.clear()
@@ -96,14 +116,39 @@ def clean_env(monkeypatch):
             monkeypatch.delenv(name, raising=False)
 
 
-@pytest.fixture
-def api(monkeypatch, tmp_path):
-    fake = FakeAPI()
+def serve(monkeypatch, fake):
     real = supermemory.Supermemory
     monkeypatch.setattr(supermemory, "Supermemory",
                         lambda **options: real(http_client=httpx.Client(transport=httpx.MockTransport(fake)), **options))
     monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
     return fake
+
+
+@pytest.fixture
+def api(monkeypatch, tmp_path):
+    return serve(monkeypatch, FakeAPI())
+
+
+@pytest.fixture
+def gateway(monkeypatch, tmp_path):
+    return serve(monkeypatch, AppendGateway())
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    class Clock(datetime):
+        at = datetime(2026, 10, 20, 3, 59, 30, tzinfo=timezone.utc)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.at.astimezone(tz) if tz else cls.at.astimezone().replace(tzinfo=None)
+
+    monkeypatch.setattr(sm, "datetime", Clock)
+    return Clock
+
+
+def opt_in(home, **config):
+    (home / "supermemory.json").write_text(json.dumps({"capture_writes": "append_delta", **config}))
 
 
 def make_provider(home, session_id="session-1", **kwargs):
@@ -141,6 +186,10 @@ def test_config_file_and_normalization(tmp_path):
     assert sm._sanitize_tag(sm._expand_container_tag(config["container_tag"], "coder")) == "hermes-coder"
     assert sm._load_supermemory_config(None)["dreaming"] == "dynamic"
     assert sm._load_supermemory_config(None)["profile_frequency"] == 50
+    assert sm._load_supermemory_config(None)["capture_writes"] == "replace"
+    for value, mode in (("append_delta", "append_delta"), (" Append_Delta ", "append_delta"), ("append", "replace"), (True, "replace")):
+        (tmp_path / "supermemory.json").write_text(json.dumps({"capture_writes": value}))
+        assert sm._load_supermemory_config(str(tmp_path))["capture_writes"] == mode  # only the exact value opts in
 
 
 def test_each_turn_rewrites_one_growing_document(api, tmp_path):
@@ -538,3 +587,181 @@ def test_undo_after_a_failed_write_rewrites_the_shorter_snapshot(api, tmp_path):
     provider.on_session_switch("session-2", reset=True)
     provider.shutdown()
     assert api.captures() == {"hermes_session-1": TURN1} and provider._pending == {}
+
+
+# The real SDK 5.0.0 constructor (the fixture only adds its transport): endpoint, key and source header reach every request.
+def test_sdk_client_sends_the_configured_endpoint_key_and_source_header(api, tmp_path, monkeypatch):
+    monkeypatch.setenv("SUPERMEMORY_BASE_URL", "http://env-host.invalid:6767")
+    make_provider(tmp_path).prefetch("q")
+    assert {r["url"].split("/ns/")[0] for r in api.requests} == {"http://env-host.invalid:6767"}
+    (tmp_path / "supermemory.json").write_text(json.dumps({"base_url": "https://gateway.example.invalid/sm-proxy/",
+                                                           "container_tag": "team:alpha"}))
+    api.requests.clear()
+    provider = make_provider(tmp_path)
+    provider.prefetch("q")
+    provider.sync_turn("Book the usual table", "Booked.", messages=transcript(("Book the usual table", "Booked.")))
+    assert {r["url"].split("/ns/")[0] for r in api.requests} == {"https://gateway.example.invalid/sm-proxy"}  # config beats env
+    assert {(r["headers"]["authorization"], r["headers"]["x-sm-source"]) for r in api.requests} == {("Bearer test-key", "hermes")}
+    assert [(w["method"], w["url"]) for w in api.writes()] == [
+        ("PATCH", "https://gateway.example.invalid/sm-proxy/ns/team:alpha/document/hermes_session-1"),
+        ("POST", "https://gateway.example.invalid/sm-proxy/ns/team:alpha/document")]
+    assert set(api.writes()[1]["body"]) == {"id", "content", "date", "metadata", "supportingContext", "dreaming"}
+
+
+TURN4 = "[role: user]\nThanks\n[user:end]\n[role: assistant]\nAny time.\n[assistant:end]"
+TURNS = (("Book the usual table", "Booked."), ("And a cab at 7.", "Cab booked."), ("Make it 8 instead.", "Moved to 8."),
+         ("Thanks", "Any time."))
+
+
+def sent(fake):
+    return [(w["body"]["id"], w["body"]["content"]) for w in fake.writes()]
+
+
+def test_default_capture_does_not_fall_back_to_post_when_replacing_is_refused(gateway, tmp_path, caplog):
+    provider = make_provider(tmp_path)  # capture_writes left at "replace"
+    provider.sync_turn("Book the usual table", "Booked.", messages=transcript(TURNS[0]))
+    assert [w["method"] for w in gateway.writes()] == ["PATCH"] and gateway.captures() == {}
+    assert "Supermemory capture failed" in caplog.text
+
+
+def test_append_delta_posts_only_the_new_turns(gateway, tmp_path):
+    opt_in(tmp_path, container_tag="team:alpha", enable_custom_container_tags=True, custom_containers=["project-beta"])
+    provider = make_provider(tmp_path)
+    for n in range(1, 4):
+        provider.sync_turn(*TURNS[n - 1], messages=transcript(*TURNS[:n]))
+    provider.on_session_end(transcript(*TURNS[:3]))
+    provider.on_session_switch("session-1", rewound=True)
+    provider.shutdown()
+    assert sent(gateway) == [("hermes_session-1", TURN1), ("hermes_session-1", TURN2), ("hermes_session-1", TURN3)]
+    assert gateway.captures() == {"hermes_session-1": "\n\n".join((TURN1, TURN2, TURN3))}
+    assert [(r["method"], r["path"]) for r in gateway.requests] == [("GET", "/ns/team:alpha/document/hermes_session-1")] + [
+        ("POST", "/ns/team:alpha/document")] * 3  # one read to learn what is stored, never a PATCH, only the primary namespace
+    body = gateway.writes()[1]["body"]
+    assert body["metadata"] == {"sm_source": "hermes", "type": "conversation", "session_id": "session-1", "docId": "hermes_session-1",
+                                "turn_offset": 1}
+    assert [w["body"]["metadata"]["turn_offset"] for w in gateway.writes()] == [0, 1, 2]  # the turns stored before each delta
+    assert body["supportingContext"] == sm._DEFAULT_ENTITY_CONTEXT and body["dreaming"] == "dynamic"
+    assert datetime.fromisoformat(body["date"]).tzinfo is not None
+    assert {r["headers"]["x-sm-source"] for r in gateway.requests} == {"hermes"}
+
+
+def test_append_delta_rewind_appends_the_new_turn_and_keeps_what_was_stored(gateway, tmp_path):
+    opt_in(tmp_path)
+    provider = make_provider(tmp_path)
+    provider.sync_turn(*TURNS[1], messages=transcript(*TURNS[:2]))
+    provider.on_session_switch("session-1", rewound=True)
+    provider.sync_turn(*TURNS[2], messages=transcript(TURNS[0], TURNS[2]))
+    provider.sync_turn(*TURNS[3], messages=transcript(TURNS[0], TURNS[2], TURNS[3]))
+    assert [c for _, c in sent(gateway)] == [TURN1 + "\n\n" + TURN2, TURN3, TURN4]
+
+
+def test_append_delta_new_provider_resumes_from_the_stored_document(gateway, tmp_path):
+    opt_in(tmp_path)
+    for n in (1, 2):  # Hermes' gateway builds a provider per turn and hands it the whole transcript
+        provider = make_provider(tmp_path, session_id="local-ab12")
+        provider.sync_turn(*TURNS[n - 1], session_id="local-ab12", messages=transcript(*TURNS[:n]))
+        provider.on_session_end(transcript(*TURNS[:n]))
+        provider.shutdown()
+    compacted = [{"role": "user", "content": SUMMARY, "_compressed_summary": True}] + transcript(TURNS[1], TURNS[2])
+    provider = make_provider(tmp_path, session_id="local-ab12")
+    gateway.failures = [("/document/hermes_local-ab12", 503)]
+    provider.sync_turn(*TURNS[2], session_id="local-ab12", messages=compacted)  # stored turns unknown: sends nothing
+    assert [c for _, c in sent(gateway)] == [TURN1, TURN2]
+    provider.on_session_end(compacted)
+    assert [c for _, c in sent(gateway)] == [TURN1, TURN2, TURN3]
+    assert gateway.captures() == {"hermes_local-ab12": "\n\n".join((TURN1, TURN2, TURN3))}
+
+
+def test_append_delta_keeps_each_conversation_on_its_original_id(gateway, tmp_path):
+    opt_in(tmp_path)
+    provider = make_provider(tmp_path)
+    provider.sync_turn(*TURNS[0], messages=transcript(TURNS[0]))
+    provider.on_session_switch("session-1-c1", parent_session_id="session-1", reason="compression")
+    compacted = [{"role": "user", "content": SUMMARY, "_compressed_summary": True}] + transcript(TURNS[1])
+    provider.sync_turn(*TURNS[1], session_id="session-1-c1", messages=compacted)
+    provider.on_session_end(compacted)
+    provider.on_session_switch("session-2", reset=True)
+    provider.sync_turn(*TURNS[2], session_id="session-2", messages=transcript(TURNS[2]))
+    provider.on_session_end(transcript(TURNS[2]))
+    provider.shutdown()
+    assert [(w["body"]["id"], w["body"]["content"], w["body"]["metadata"]["session_id"]) for w in gateway.writes()] == [
+        ("hermes_session-1", TURN1, "session-1"), ("hermes_session-1", TURN2, "session-1"), ("hermes_session-2", TURN3, "session-2")]
+    assert gateway.captures() == {"hermes_session-1": TURN1 + "\n\n" + TURN2, "hermes_session-2": TURN3}
+
+
+def test_append_delta_failure_keeps_the_checkpoint_and_retries_the_exact_request(gateway, tmp_path, caplog):
+    opt_in(tmp_path)
+    provider = make_provider(tmp_path)
+    provider.sync_turn(*TURNS[0], messages=transcript(TURNS[0]))
+    gateway.failures = [("hermes/document", 503)]
+    provider.sync_turn(*TURNS[1], messages=transcript(*TURNS[:2]))
+    assert gateway.captures() == {"hermes_session-1": TURN1} and "Supermemory capture failed" in caplog.text
+    provider.sync_turn(*TURNS[2], messages=transcript(*TURNS[:3]))
+    bodies = [w["body"] for w in gateway.writes()]
+    assert [b["content"] for b in bodies] == [TURN1, TURN2, TURN2, TURN3] and bodies[2] == bodies[1]
+    # Stored, but the response is lost: the plugin cannot tell, so it resends; only an idempotent backend keeps one copy.
+    gateway.lose = [True]
+    provider.sync_turn(*TURNS[3], messages=transcript(*TURNS))
+    provider.on_session_end(transcript(*TURNS))
+    provider.shutdown()
+    assert [c for _, c in sent(gateway)][-2:] == [TURN4, TURN4]
+    assert gateway.captures() == {"hermes_session-1": "\n\n".join((TURN1, TURN2, TURN3, TURN4))}
+
+
+def test_append_delta_identical_turns_in_the_same_second_are_two_requests(gateway, tmp_path, clock):
+    opt_in(tmp_path)
+    provider = make_provider(tmp_path)
+    provider.sync_turn(*TURNS[3], messages=transcript(TURNS[3]))
+    gateway.lose = [True]  # the same turn again within the second: stored, but the response is lost
+    provider.sync_turn(*TURNS[3], messages=transcript(TURNS[3], TURNS[3]))
+    provider.on_session_end(transcript(TURNS[3], TURNS[3]))
+    provider.shutdown()
+    assert gateway.captures() == {"hermes_session-1": TURN4 + "\n\n" + TURN4}
+    first, second, retry = (w["body"] for w in gateway.writes())
+    assert first["content"] == second["content"] == TURN4 and first["date"] == second["date"]
+    assert second != first and retry == second  # a new turn is a new request, a retry the same one
+    make_provider(tmp_path).sync_turn(*TURNS[3], messages=transcript(*[TURNS[3]] * 3))  # a new provider counts the stored turns
+    assert gateway.captures() == {"hermes_session-1": "\n\n".join([TURN4] * 3)}
+
+
+def test_append_delta_of_a_past_session_is_retried_to_its_own_document(gateway, tmp_path):
+    opt_in(tmp_path)
+    provider = make_provider(tmp_path)
+    provider.sync_turn(*TURNS[0], messages=transcript(TURNS[0]))
+    gateway.failures = [("hermes/document", 503)] * 2
+    provider.sync_turn(*TURNS[1], messages=transcript(*TURNS[:2]))
+    provider.on_session_switch("session-2", reset=True)  # its flush fails too, so the delta is parked
+    provider.sync_turn(*TURNS[2], session_id="session-2", messages=transcript(TURNS[2]))
+    provider.shutdown()
+    assert sent(gateway)[-2:] == [("hermes_session-1", TURN2), ("hermes_session-2", TURN3)] and provider._pending == {}
+    assert gateway.captures() == {"hermes_session-1": TURN1 + "\n\n" + TURN2, "hermes_session-2": TURN3}
+
+
+def test_append_delta_without_a_session_uses_four_hour_utc_windows(gateway, tmp_path, clock):
+    windows = [sm._window_doc_id(datetime.fromisoformat(at)) for at in (
+        "2026-10-20T03:59:59+00:00", "2026-10-20T04:00:00+00:00", "2026-10-20T23:59:59+00:00", "2026-10-21T00:00:00+00:00",
+        "2026-10-21T01:30:00+02:00")]
+    assert windows == ["hermes_background_2026-10-20_b0", "hermes_background_2026-10-20_b1", "hermes_background_2026-10-20_b5",
+                       "hermes_background_2026-10-21_b0", "hermes_background_2026-10-20_b5"]
+    opt_in(tmp_path)
+    provider = make_provider(tmp_path, session_id="")
+    gateway.failures = [("hermes/document", 503)]
+    provider.sync_turn(*TURNS[0], messages=transcript(TURNS[0]))
+    clock.at = datetime(2026, 10, 20, 4, 0, 10, tzinfo=timezone.utc)
+    provider.sync_turn(*TURNS[1], messages=transcript(*TURNS[:2]))  # the failed delta keeps its window
+    provider.on_session_end(transcript(*TURNS[:2]))
+    provider.shutdown()
+    assert sent(gateway) == [("hermes_background_2026-10-20_b0", TURN1)] * 2 + [("hermes_background_2026-10-20_b1", TURN2)]
+    assert gateway.writes()[1]["body"] == gateway.writes()[0]["body"]  # the clock moved on, the retry did not
+    assert gateway.captures() == {"hermes_background_2026-10-20_b0": TURN1, "hermes_background_2026-10-20_b1": TURN2}
+
+
+@pytest.mark.parametrize("config, context", [({"auto_capture": False}, "primary"), ({}, "cron")], ids=["auto_capture-off", "cron"])
+def test_append_delta_sends_nothing_when_capture_is_off(gateway, tmp_path, config, context):
+    opt_in(tmp_path, **config)
+    provider = make_provider(tmp_path, agent_context=context)
+    provider.sync_turn(*TURNS[0], messages=transcript(TURNS[0]))
+    provider.on_session_end(transcript(TURNS[0]))
+    provider.on_session_switch("session-2", reset=True)
+    provider.shutdown()
+    assert [r for r in gateway.requests if "/document" in r["path"]] == []

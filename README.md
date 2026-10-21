@@ -61,6 +61,7 @@ Config file: `$HERMES_HOME/supermemory.json`
 | `entity_context` | built-in default | Extraction guidance passed to Supermemory |
 | `dreaming` | `dynamic` | `dynamic` groups related conversations before forming memories; `instant` processes each one right away (billed as one extra operation) |
 | `api_timeout` | `5.0` | Timeout for SDK requests |
+| `capture_writes` | `replace` | `replace` rewrites each conversation document in full. `append_delta` sends only new turns and is **only for a backend built to append them**; see [Append-only backends](#append-only-backends-capture_writes-append_delta) |
 
 ### Upgrading from 1.0.1
 
@@ -105,13 +106,60 @@ Supermemory app, so you can filter, browse, and bulk-manage them per source agen
 When enabled, Hermes can:
 
 - before each turn, recall relevant memories, plus profile facts on the first turn and every `profile_frequency` turns
-- after each completed turn, save the conversation so far as **one document per conversation**, rewritten in full, so undo, edits and context compaction never store it twice
+- after each completed turn, save the conversation so far as **one document per conversation**, rewritten in full (`capture_writes: replace`, the default), so undo, edits and context compaction never store it twice
 - skip a save when nothing changed, and retry a failed one later (up to 50 conversations); a failed save is logged and never breaks the turn
 - store messages as given (only the plugin's own recalled `<supermemory-context>` block and inline base64 images are left out)
 - copy built-in `memory` tool additions into Supermemory
 - route every SDK and probe request through the configured hosted or self-hosted endpoint
 - expose explicit tools for search, store, forget, profile, and reading documents
 
+
+## Append-only backends (`capture_writes: append_delta`)
+
+> **Leave this off for Supermemory itself (hosted or self-hosted).** The Supermemory API does not promise that a
+> second `POST` with the same document id appends to it. Turning this on against a backend that replaces or merges
+> on same-id `POST` can lose or garble conversation history.
+
+By default, each capture `PATCH`es the conversation document with the whole conversation, and `POST`s it when the `PATCH`
+returns 404. Some deployments put an authenticated gateway in front of the API that refuses replacing `PATCH`es, to
+protect history it has already accumulated. With the default, that gateway refuses the capture: it is logged and kept for
+retry, and it is never turned into a `POST`. For such a backend only:
+
+```json
+{
+  "capture_writes": "append_delta"
+}
+```
+
+The plugin then `POST`s only the turns the document does not hold yet to `/ns/<container_tag>/document`, with the same `id` each
+time. The metadata is the default mode's (`sm_source`, `type: conversation`, `session_id`, `docId`) plus `turn_offset`, the
+number of the conversation's turns the plugin counts as stored before this one. It never `PATCH`es. The backend **must**:
+
+- append the `content` of a `POST` to an existing `id` to the stored text, unchanged and in order;
+- ignore an exact retry: a `POST` to the same namespace whose JSON body is identical to one it already appended. A failed
+  send is resent as that identical request (same id, content, date and metadata) before anything newer. A response lost
+  after the backend stored the turn looks the same as a failure, so without this the turn is stored twice. Delivery is
+  at least once, not exactly once. Compare the whole body: the same turn sent again within a second has the same content
+  and `date` (whole seconds) and differs only in `turn_offset`, and it is a new turn;
+- answer `GET /ns/<container_tag>/document/<id>` with the accumulated text (404 before the first write). A new provider
+  (Hermes' gateway builds one per turn) reads it once to learn which turns are already stored. If that read fails, the
+  plugin sends nothing until a later read succeeds, rather than resending the whole conversation.
+
+Document ids are `hermes_<session id>`. A conversation keeps the id of the session it started in, through context
+compaction into child sessions; a reset or new session starts a new id.
+
+Captures without a session id go to `hermes_background_<YYYY-MM-DD>_b<0-5>`, one document per four-hour UTC window, shared by
+all such captures. A failed send keeps its window, and a provider that runs across a window boundary sends only its new
+turns to the next window. Without a session id there is no conversation to resume, though: a provider that starts fresh
+learns only what the current window holds, and that may include other captures. It sends again the turns of its
+transcript that an earlier window holds, or that it cannot line up with the current window (storing them twice), and it
+may skip a turn identical to one another capture already stored there.
+
+Undo and edits cannot remove turns that were already sent, including a failed send that is being retried: the edited or
+new turns are appended after them.
+
+As in the default mode, failed sends are retried from memory only (up to 50 pending sends, 256 KiB). If Hermes exits
+first, they are sent only when that conversation is captured again.
 
 ## Profile-Scoped Containers
 

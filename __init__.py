@@ -126,6 +126,8 @@ _CONFIG_SPEC: Dict[str, tuple] = {
     "enable_custom_container_tags": (False, lambda v: _as_bool(v, False)),
     "custom_containers": ([], lambda v: [str(t) for t in v if t] if isinstance(v, list) else []),
     "custom_container_instructions": ("", lambda v: str(v).strip()),
+    # "append_delta" is only for a backend that appends same-id POSTs (see README); anything else keeps "replace".
+    "capture_writes": ("replace", lambda v: "append_delta" if str(v).strip().lower() == "append_delta" else "replace"),
 }
 
 
@@ -253,11 +255,16 @@ class _SupermemoryClient:
         return {"id": _as_dict(self._client.add(container_tag or self._container_tag, **kwargs)).get("id") or ""}
 
     # PATCH replaces the whole document, so a resend, rewind or edit never appends it to itself; the first write creates it.
-    def write_document(self, doc_id: str, content: str, metadata: dict, *, entity_context: str = "", dreaming: str = "") -> None:
-        kwargs: dict[str, Any] = {"content": content.strip(), "date": datetime.now().astimezone().isoformat(timespec="seconds"),
+    # ``append`` (capture_writes: append_delta) POSTs only new turns to the same id, for a backend that appends them.
+    def write_document(self, doc_id: str, content: str, metadata: dict, *, entity_context: str = "", dreaming: str = "",
+                       date: str = "", append: bool = False) -> None:
+        kwargs: dict[str, Any] = {"content": content.strip(), "date": date or datetime.now().astimezone().isoformat(timespec="seconds"),
                                   "metadata": self._merge_metadata(metadata),
                                   **({"supporting_context": _clamp_entity_context(entity_context)} if entity_context else {}),
                                   **({"dreaming": dreaming} if dreaming else {})}
+        if append:
+            self._client.add(self._container_tag, id=doc_id, **kwargs)
+            return
         try:
             self._client.documents.update(self._container_tag, urllib.parse.quote(doc_id, safe=""), **kwargs)
         except self._sm.NotFoundError:
@@ -327,6 +334,12 @@ def _format_turn(user: str, assistant: str) -> str:
 
 def _capture_doc_id(session_id: str) -> str:
     return _cap_tag(f"hermes_{_sanitize_tag(session_id)}")
+
+
+# append_delta captures without a session id: one document per four-hour UTC window, so none grows without bound.
+def _window_doc_id(now: datetime) -> str:
+    utc = now.astimezone(timezone.utc)
+    return _capture_doc_id(f"background_{utc:%Y-%m-%d}_b{utc.hour // 4}")
 
 
 def _message_text(content: Any) -> str:
@@ -449,7 +462,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
     def _apply_config(self, config: dict) -> None:
         for key in ("auto_recall", "auto_capture", "max_recall_results", "profile_frequency", "capture_mode",
-                    "search_mode", "entity_context", "dreaming", "api_timeout", "custom_container_instructions"):
+                    "search_mode", "entity_context", "dreaming", "api_timeout", "custom_container_instructions", "capture_writes"):
             setattr(self, f"_{key}", config[key])
         self._custom_containers = [_sanitize_tag(t) for t in config["custom_containers"]]
         self._base_url, self._enable_custom_containers = _resolve_base_url(config["base_url"]), config["enable_custom_container_tags"]
@@ -565,10 +578,14 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._captured_digest: Optional[str] = None
         self._unsent: Optional[dict] = None
         self._legacy_text: Optional[str] = None
+        self._sent: Optional[List[Dict[str, str]]] = None  # append_delta: the turns of this conversation known to be stored
 
+    # An append delta names its document and keeps its first date, so a retry is the exact same request.
     def _write(self, doc_id: str, doc: dict, mode: str) -> bool:
+        doc_id = doc.get("append_to", doc_id)
         return _quietly(lambda: self._client.write_document(doc_id, doc["content"], doc["metadata"], entity_context=self._entity_context,
-                                                            dreaming=self._dreaming) or True,
+                                                            dreaming=self._dreaming, date=doc.get("date", ""),
+                                                            append="append_to" in doc) or True,
                         "Supermemory capture failed (%s, document %s)", mode, doc_id, level=logging.WARNING, default=False)
 
     # Documents of earlier sessions whose last write failed.
@@ -579,8 +596,10 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
     # A down service must not grow the retry buffer without bound; the oldest documents go first.
     def _park_unsent(self) -> None:
-        if self._unsent:
-            self._pending[self._doc_id] = self._unsent
+        if self._unsent:  # an append delta is one of several for its document, so it gets a key of its own
+            key = (f"{self._unsent['append_to']}#{hashlib.sha256(self._unsent['content'].encode()).hexdigest()[:12]}"
+                   if "append_to" in self._unsent else self._doc_id)
+            self._pending[key] = self._unsent
         while len(self._pending) > _MAX_PENDING_DOCS or sum(len(d["content"]) for d in self._pending.values()) > _MAX_PENDING_BYTES:
             dropped = next(iter(self._pending))
             self._pending.pop(dropped)
@@ -606,20 +625,51 @@ class SupermemoryMemoryProvider(MemoryProvider):
     def _seed_archive(self, messages: Optional[list]) -> bool:
         if self._archive or self._captured_digest or not any(isinstance(m, dict) and m.get("_compressed_summary") for m in messages or []):
             return True
+        stored = self._stored_turns(self._doc_id)
+        self._archive = stored or []
+        return stored is not None
+
+    # The turns a stored conversation document holds ([] when it does not exist); None when the read failed.
+    def _stored_turns(self, doc_id: str) -> Optional[List[Dict[str, str]]]:
         try:
-            stored = self._client.read_document(self._doc_id, 0, limit=None)["content"]
+            stored = self._client.read_document(doc_id, 0, limit=None)["content"]
         except self._client._sm.NotFoundError:
             stored = ""
         except Exception:
-            logger.warning("Supermemory: could not read %s; its next write waits so earlier turns are not dropped", self._doc_id, exc_info=True)
-            return False
-        self._archive = [{"user": u, "assistant": a} for u, a in _STORED_TURN_RE.findall(stored)]
-        return True
+            logger.warning("Supermemory: could not read %s; its next write waits so earlier turns are not dropped", doc_id, exc_info=True)
+            return None
+        return [{"user": u, "assistant": a} for u, a in _STORED_TURN_RE.findall(stored)]
+
+    # capture_writes: append_delta. Only turns the document does not hold yet are POSTed, and a failed delta is resent as the
+    # exact same request before anything newer. A lost response cannot be told from a refused one, so delivery is at least
+    # once: only a backend that ignores an exact retry keeps a single copy.
+    def _append_new_turns(self, turns: List[Dict[str, str]], mode: str) -> None:
+        if self._unsent:
+            if not self._write(self._doc_id, self._unsent, mode):
+                return
+            self._sent, self._unsent = self._sent + self._unsent["turns"], None
+        doc_id = self._doc_id if self._doc_session else _window_doc_id(datetime.now(timezone.utc))
+        if self._sent is None:  # a new provider (Hermes' gateway builds one per turn) first learns what is stored
+            self._sent = self._stored_turns(doc_id)
+            if self._sent is None:
+                return
+        new = _join_turns(self._sent, turns)[len(self._sent):]
+        if not new:
+            return
+        # turn_offset (the turns stored before it) keeps the same turn sent twice within a second from looking like a retry.
+        delta = {"append_to": doc_id, "turns": new, "content": "\n\n".join(_format_turn(t["user"], t["assistant"]) for t in new),
+                 "date": datetime.now().astimezone().isoformat(timespec="seconds"),
+                 "metadata": {"type": "conversation", "session_id": self._doc_session, "docId": doc_id, "turn_offset": len(self._sent)}}
+        if self._write(doc_id, delta, mode):
+            self._sent = self._sent + new
+        else:
+            self._unsent = delta
 
     def _capture(self, mode: str, messages: Optional[list] = None, *, completed_only: bool = False) -> None:
         with self._capture_lock:
             self._retry_pending(mode)
-            if not self._seed_archive(messages):
+            append = self._capture_writes == "append_delta"
+            if not append and not self._seed_archive(messages):  # append_delta reads the stored turns itself
                 return
             turns = _turns_from_messages(messages)
             if completed_only and turns and not turns[-1]["assistant"]:
@@ -628,6 +678,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
             turns = self._without_legacy_turns(_join_turns(self._archive, self._turns))
             if not turns:
                 return
+            if append:
+                return self._append_new_turns(turns, mode)
             content = "\n\n".join(_format_turn(t["user"], t["assistant"]) for t in turns)
             digest = hashlib.sha256(content.encode()).hexdigest()
             if digest == self._captured_digest and self._unsent is None:
