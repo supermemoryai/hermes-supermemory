@@ -44,7 +44,6 @@ _MAX_PENDING_BYTES = 256 * 1024
 _SUMMARY_END = "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
 _MERGED_PRIOR_HEADER = "[PRIOR CONTEXT — for reference only; not a new message]"
 _MERGED_SUMMARY_DELIMITER = "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]"
-_LEGACY_TEXT: Dict[tuple, str] = {}
 _STORED_TURN_RE = re.compile(r"\[role: user\]\n(.*?)\n\[user:end\](?:\n\[role: assistant\]\n(.*?)\n\[assistant:end\])?", re.DOTALL)
 _DEFAULT_ENTITY_CONTEXT = (
     "User-assistant conversation. Format: [role: user]...[user:end] and [role: assistant]...[assistant:end].\n\n"
@@ -138,7 +137,6 @@ _CONFIG_SPEC: Dict[str, tuple] = {
     "include_forgotten": (False, lambda v: _as_bool(v, False)),
     "allow_agent_search_overrides": (True, lambda v: _as_bool(v, True)),
     "profile_frequency": (50, lambda v: _clamp_number(v, 50, 1, 500, int)),
-    "capture_mode": ("all", lambda v: "everything" if v == "everything" else "all"),
     "search_mode": ("hybrid", _search_mode),
     "entity_context": (_DEFAULT_ENTITY_CONTEXT, lambda v: _clamp_entity_context(str(v))),
     "dreaming": ("dynamic", lambda v: v if (v := str(v or "").strip().lower()) in _VALID_DREAMING else "dynamic"),
@@ -225,7 +223,8 @@ def _result_fields(item: dict) -> dict:
     metadata = item.get("metadata") or {}
     document = (item.get("included") or {}).get("document") or {}
     return {"id": item.get("id") or "", "memory": item.get("memory") or item.get("chunk") or "", "related": (item.get("included") or {}).get("related"),
-            "similarity": item.get("similarity"), "updated_at": item.get("updatedAt") or item.get("updated_at"),
+            "similarity": item.get("similarity"),
+            "updated_at": (item.get("system") or {}).get("updatedAt") or item.get("updatedAt") or item.get("updated_at"),
             "document_id": metadata.get("docId") or document.get("id") or item.get("documentId") or "",
             "metadata": metadata}
 
@@ -299,6 +298,14 @@ class _SupermemoryClient:
                if (d.get("metadata") or {}).get("type") == "conversation" and "docId" not in (d.get("metadata") or {})]
         return "\n\n".join(_as_dict(self._client.documents.get(self._container_tag, urllib.parse.quote(i, safe=""))).get("content") or ""
                            for i in ids)
+
+    def forget_mirrored(self, target: str, content: str, *, container_tag: str) -> None:
+        listed = _as_dict(self._client.list(container_tag, "documents", limit=100, include={"content": True}, filter={
+            "operator": "and", "operands": [{"field": "type", "operator": "eq", "value": "explicit_memory"},
+                                            {"field": "target", "operator": "eq", "value": target}]}))
+        ids = [d["id"] for d in listed.get("documents") or [] if (d.get("content") or "").strip() == content]
+        if ids:
+            self._client.documents.delete(container_tag, ids=ids)
 
     def search_memories(self, query: str, *, limit: int = 5, container_tag: Optional[str] = None,
                         search_mode: Optional[str] = None, threshold: Optional[float] = None, rerank: str = "",
@@ -487,7 +494,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
     def _apply_config(self, config: dict) -> None:
         for key in ("auto_recall", "auto_capture", "max_recall_results", "threshold", "rerank", "rewrite_query", "include_documents",
-                    "include_related", "include_forgotten", "allow_agent_search_overrides", "profile_frequency", "capture_mode",
+                    "include_related", "include_forgotten", "allow_agent_search_overrides", "profile_frequency",
                     "search_mode", "entity_context", "dreaming", "api_timeout", "custom_container_instructions"):
             setattr(self, f"_{key}", config[key])
         self._custom_containers = [_sanitize_tag(t) for t in config["custom_containers"]]
@@ -687,16 +694,9 @@ class SupermemoryMemoryProvider(MemoryProvider):
     def _without_legacy_turns(self, turns: List[Dict[str, str]]) -> List[Dict[str, str]]:
         if self._container_tag != self._base_tag:
             return turns
-        key = (self._base_url, self._container_tag, self._doc_session)
-        if self._legacy_text is None and key in _LEGACY_TEXT:
-            self._legacy_text = _LEGACY_TEXT[key]
         if self._legacy_text is None:
             self._legacy_text = "" if len(turns) <= 1 else _quietly(lambda: self._client.legacy_capture_text(self._doc_session),
                                                                      "Supermemory 1.x document lookup failed", level=logging.WARNING)
-            if self._legacy_text is not None and len(turns) > 1:
-                if len(_LEGACY_TEXT) > 256:
-                    _LEGACY_TEXT.clear()
-                _LEGACY_TEXT[key] = self._legacy_text
         if not self._legacy_text:
             return turns
         return turns[next((i for i, t in enumerate(turns) if _format_turn(t["user"], t["assistant"]) not in self._legacy_text), len(turns)):]
@@ -767,12 +767,12 @@ class SupermemoryMemoryProvider(MemoryProvider):
                     self._unsent_appends.append((tag, meta, content))
             del self._unsent_appends[:-_MAX_PENDING_DOCS]
 
-    def _flush(self, mode: str, messages: Optional[list] = None) -> None:
+    def _flush(self, mode: str, messages: Optional[list] = None, *, completed_only: bool = False) -> None:
         if self._can_write() and self._auto_capture:
-            self._append_turns([]) if self._per_speaker else self._capture(mode, messages)
+            self._append_turns([]) if self._per_speaker else self._capture(mode, messages, completed_only=completed_only)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        self._flush("session_end", messages)
+        self._flush("session_end", messages, completed_only=True)
 
     # Compaction continues the conversation and its document; a rewind needs nothing, the next transcript rewrites it.
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False, **kwargs) -> None:
@@ -791,17 +791,20 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 self._turn_count = 0
         self._session_id = new_id or self._session_id
 
-    def on_memory_write(self, action: str, target: str, content: str) -> None:
-        if not self._can_write() or action != "add" or not (content or "").strip():
+    # A replace or remove drops the mirrored copy of the entry it changed, matched by its exact text.
+    def on_memory_write(self, action: str, target: str, content: str, metadata: Optional[dict] = None) -> None:
+        content, previous = (content or "").strip(), str((metadata or {}).get("previous_content") or "").strip()
+        tag, speaker = self._speaker_tag(self._speaker), self._speaker
+        jobs = ([lambda: self._client.forget_mirrored(target, previous, container_tag=tag)] if action in {"replace", "patch", "remove"} and previous else [])
+        jobs += ([lambda: self._client.add_memory(content, metadata={"target": target, "type": "explicit_memory", **self._ids(speaker)},
+                                                  entity_context=self._entity_context, container_tag=tag, dreaming=self._dreaming)]
+                 if action in {"add", "replace", "patch"} and content else [])
+        if not self._can_write() or not jobs:
             return
         if self._write_thread and self._write_thread.is_alive():
             self._write_thread.join(timeout=2.0)
         self._write_thread = spawn_context_thread(
-            _quietly, daemon=False, name="supermemory-memory-write",
-            args=(lambda: self._client.add_memory(content.strip(), metadata={"target": target, "type": "explicit_memory", **self._ids(self._speaker)},
-                                                  entity_context=self._entity_context, container_tag=self._speaker_tag(self._speaker),
-                                                  dreaming=self._dreaming),
-                  "Supermemory on_memory_write failed"))
+            lambda: [_quietly(job, "Supermemory on_memory_write (%s) failed", action) for job in jobs], daemon=False, name="supermemory-memory-write")
         self._write_thread.start()
 
     def shutdown(self) -> None:
@@ -836,7 +839,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         content = str(args.get("content") or "").strip()
         if not content:
             return tool_error("content is required")
-        metadata = args.get("metadata") if isinstance(args.get("metadata"), dict) else {}
+        metadata = dict(args["metadata"]) if isinstance(args.get("metadata"), dict) else {}
         metadata.setdefault("type", _detect_category(content))
         metadata.pop("source", None)
         tag = self._tool_container_tag(args)

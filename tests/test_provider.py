@@ -51,7 +51,7 @@ class FakeAPI:
         if path.endswith("/search"):
             return httpx.Response(200, json={"results": self.results})
         if path.endswith("/document") and method == "POST":
-            doc_id = body.get("id") or f"auto-{len(self.docs)}"
+            doc_id = body.get("id") or f"auto-{len(self.requests)}"
             old = self.docs.get(doc_id, {}).get("content", "")
             content = body["content"] if not old or body["content"].startswith(old) else old + "\n\n" + body["content"]
             self.docs[doc_id] = {**self.docs.get(doc_id, {}), **body, "id": doc_id, "content": content}
@@ -63,9 +63,11 @@ class FakeAPI:
             self.docs[doc_id] = {**self.docs[doc_id], **body, "id": doc_id}
             return httpx.Response(200, json={"id": doc_id, "status": "queued"})
         if path.endswith("/list/documents"):
-            wanted = next((p["value"] for p in [body.get("filter") or {}] if p.get("field") == "session_id"), None)
-            docs = [{"id": k, "type": "text", "metadata": v.get("metadata") or {}, "system": {"status": "done"}}
-                    for k, v in self.docs.items() if (v.get("metadata") or {}).get("session_id") == wanted]
+            wanted = body.get("filter") or {}
+            wanted = {p["field"]: p["value"] for p in wanted.get("operands") or [wanted]}
+            docs = [{"id": k, "type": "text", "metadata": v.get("metadata") or {}, "system": {"status": "done"},
+                     **({"content": v.get("content")} if (body.get("include") or {}).get("content") else {})}
+                    for k, v in self.docs.items() if wanted.items() <= (v.get("metadata") or {}).items()]
             return httpx.Response(200, json={"documents": docs, "chunks": [], "memories": [],
                                              "pagination": {"currentPage": 1, "totalItems": len(docs), "totalPages": 1, "limit": 100}})
         if "/document/" in path:
@@ -73,6 +75,9 @@ class FakeAPI:
             if doc_id not in self.docs:
                 return httpx.Response(404, json={"error": "Document not found"})
             return httpx.Response(200, json={"type": "text", "metadata": {}, "system": {"status": "done"}, **self.docs[doc_id]})
+        if method == "DELETE" and path.endswith("/document"):
+            gone = [i for i in body["ids"] if self.docs.pop(i, None)]
+            return httpx.Response(200, json={"count": len(gone), "errors": []})
         if method == "DELETE" and path.endswith("/memories"):
             ids = body.get("ids") or []
             known = [i for i in ids if any(r["id"] == i for r in self.results)]
@@ -90,7 +95,6 @@ class FakeAPI:
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
-    sm._LEGACY_TEXT.clear()
     for name in list(os.environ):
         if name.startswith("SUPERMEMORY_"):
             monkeypatch.delenv(name, raising=False)
@@ -294,15 +298,21 @@ def test_read_document_pages_and_encodes_ids(api, tmp_path):
     assert missing["error"].startswith("Read failed:")
 
 
-def test_builtin_memory_add_is_mirrored(api, tmp_path):
+def test_builtin_memory_writes_are_mirrored(api, tmp_path):
     provider = make_provider(tmp_path)
     provider.on_memory_write("add", "user", "likes tea")
-    provider.on_memory_write("replace", "user", "likes coffee")
+    provider.on_memory_write("add", "memory", "likes tea")
     provider.shutdown()
     bodies = [w["body"] for w in api.writes()]
-    assert bodies == [{"content": "likes tea", "date": bodies[0]["date"], "supportingContext": sm._DEFAULT_ENTITY_CONTEXT,
-                       "dreaming": "dynamic",
-                       "metadata": {"sm_source": "hermes", "target": "user", "type": "explicit_memory"}}]
+    assert bodies[0] == {"content": "likes tea", "date": bodies[0]["date"], "supportingContext": sm._DEFAULT_ENTITY_CONTEXT,
+                         "dreaming": "dynamic", "metadata": {"sm_source": "hermes", "target": "user", "type": "explicit_memory"}}
+    provider.on_memory_write("replace", "user", "likes coffee", metadata={"previous_content": "likes tea"})
+    provider.shutdown()
+    mirrored = lambda: sorted((d["metadata"]["target"], d["content"]) for d in api.docs.values())
+    assert mirrored() == [("memory", "likes tea"), ("user", "likes coffee")]
+    provider.on_memory_write("remove", "user", "", metadata={"previous_content": "likes coffee"})
+    provider.shutdown()
+    assert mirrored() == [("memory", "likes tea")]
 
 
 def test_custom_containers_are_namespaces(api, tmp_path):
@@ -696,3 +706,27 @@ def test_locked_search_options_are_hidden_and_ignored(api, tmp_path):
     assert set(search["parameters"]["properties"]) == {"query", "limit"}
     provider.handle_tool_call("supermemory-search", {"query": "email", "search_mode": "chunks", "aggregate": True})
     assert search_bodies(api) == [{"query": "email", "limit": 5, "searchMode": "hybrid", "threshold": 0.5}]
+
+
+def test_recall_dates_come_from_system_updated_at(api, tmp_path):
+    api.results = [{"id": "m1", "memory": "Morgan prefers email", "similarity": 0.91, "metadata": {},
+                    "system": {"updatedAt": datetime.now().astimezone().isoformat()}}]
+    assert "- [just now] [91%] Morgan prefers email" in make_provider(tmp_path).prefetch("email?")
+
+
+def test_session_end_leaves_out_an_unanswered_message(api, tmp_path):
+    provider = make_provider(tmp_path)
+    provider.on_session_end(transcript(("Book the usual table", "Booked.")) + [{"role": "user", "content": "Hello?"}])
+    assert api.captures() == {"hermes_session-1": TURN1}
+
+
+def test_store_leaves_the_callers_metadata_alone(api, tmp_path):
+    metadata = {"source": "chat", "topic": "hours"}
+    make_provider(tmp_path).handle_tool_call("supermemory-save", {"content": "Closed on Sundays.", "metadata": metadata})
+    assert metadata == {"source": "chat", "topic": "hours"}
+
+
+def test_no_module_level_mutable_state():
+    constants = {"_CONFIG_SPEC", "_KEBAB_ALIASES", "_ALIAS_TO_TOOL", "_BOOL_WORDS", "_BASE_SCHEMAS"}
+    assert [n for n, v in vars(sm).items() if isinstance(v, (dict, list, set)) and n[:1] == "_" != n[1:2] and n not in constants] == []
+

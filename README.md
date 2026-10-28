@@ -58,7 +58,6 @@ Config file: `$HERMES_HOME/supermemory.json`
 | `max_recall_results` | `10` | Max search results recalled with the profile (1-20) |
 | `threshold` | `0.5` | Minimum similarity (0-1) for automatic recall and the search tool. Automatic recall searches memories only |
 | `profile_frequency` | `50` | Include profile facts on the first turn, after a compaction, and every N turns |
-| `capture_mode` | `all` | Skip tiny or trivial turns by default |
 | `search_mode` | `hybrid` | Default mode of the search tool: `hybrid`, `memories` (memories only), `chunks` (document excerpts only; `documents` is accepted as before) |
 | `rerank` | `none` | `order` re-ranks results. The search tool can also ask for `aggregate`, which merges overlapping results |
 | `rewrite_query` | `false` | Rewrite the query before searching (about 400 ms slower) |
@@ -119,7 +118,7 @@ When enabled, Hermes can:
 - after each completed turn, save the conversation so far as **one document per conversation**, rewritten in full, so undo, edits and context compaction never store it twice
 - skip a save when nothing changed, and retry a failed one later (up to 50 conversations); a failed save is logged and never breaks the turn
 - store messages as given (only the plugin's own recalled `<supermemory-context>` block and inline base64 images are left out)
-- copy built-in `memory` tool additions into Supermemory
+- copy built-in `memory` tool additions, edits and removals into Supermemory
 - route every SDK and probe request through the configured hosted or self-hosted endpoint
 - expose explicit tools for search, store, forget, profile, and reading documents
 
