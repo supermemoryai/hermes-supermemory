@@ -57,7 +57,7 @@ Config file: `$HERMES_HOME/supermemory.json`
 | `auto_capture` | `true` | Store cleaned user-assistant turns after each response |
 | `max_recall_results` | `10` | Max search results recalled with the profile (1-20) |
 | `threshold` | `0.5` | Minimum similarity (0-1) for a recalled memory. Automatic recall searches memories only; the search tool uses `search_mode` |
-| `profile_frequency` | `50` | Include profile facts on the first turn and every N turns |
+| `profile_frequency` | `50` | Include profile facts on the first turn, after a compaction, and every N turns |
 | `capture_mode` | `all` | Skip tiny or trivial turns by default |
 | `search_mode` | `hybrid` | Search mode: `hybrid`, `memories` (memories only), `chunks` (document excerpts only; `documents` is accepted as before) |
 | `entity_context` | built-in default | Extraction guidance passed to Supermemory |
@@ -110,7 +110,8 @@ Supermemory app, so you can filter, browse, and bulk-manage them per source agen
 
 When enabled, Hermes can:
 
-- before each turn, recall relevant memories, plus profile facts on the first turn and every `profile_frequency` turns
+- before each turn, recall relevant memories not already shown in the conversation, plus profile facts on the first turn, after a compaction, and every `profile_frequency` turns; the profile is fetched in the background, so only the search delays a turn
+- show "recalled N memories" when it adds context
 - after each completed turn, save the conversation so far as **one document per conversation**, rewritten in full, so undo, edits and context compaction never store it twice
 - skip a save when nothing changed, and retry a failed one later (up to 50 conversations); a failed save is logged and never breaks the turn
 - store messages as given (only the plugin's own recalled `<supermemory-context>` block and inline base64 images are left out)

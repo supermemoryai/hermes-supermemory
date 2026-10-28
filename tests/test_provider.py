@@ -106,6 +106,12 @@ def api(monkeypatch, tmp_path):
     return fake
 
 
+def settle(provider):
+    for job in list(provider._profile_jobs.values()):
+        job.join(5)
+    return provider
+
+
 def make_provider(home, session_id="session-1", **kwargs):
     provider = SupermemoryMemoryProvider()
     provider.initialize(session_id, hermes_home=str(home), **{"platform": "cli", **kwargs})
@@ -219,7 +225,7 @@ def test_non_primary_contexts_never_write(api, tmp_path):
 
 
 def test_recall_is_full_profile_plus_search(api, tmp_path):
-    text = make_provider(tmp_path).prefetch("Book the usual table")
+    text = settle(make_provider(tmp_path)).prefetch("Book the usual table")
     assert text.startswith("<supermemory-context>\n") and text.endswith("\n</supermemory-context>")
     assert PROFILE in text  # every section, including Recent Memories
     assert "## Relevant Memories\n- [91%] Morgan prefers email" in text
@@ -232,8 +238,9 @@ def test_recall_is_full_profile_plus_search(api, tmp_path):
 
 
 def test_recall_survives_one_failing_call(api, tmp_path):
-    api.failures = [("/profile", 503)]
-    text = make_provider(tmp_path).prefetch("Book the usual table")
+    api.failures = [("/profile", 503)] * 2
+    provider = settle(make_provider(tmp_path))
+    text = settle(provider).prefetch("Book the usual table")
     assert "Morgan prefers email" in text and "Morgan runs a bakery" not in text
 
 
@@ -447,7 +454,7 @@ def test_failed_documents_of_past_sessions_are_retried_and_bounded(api, tmp_path
 
 def test_profile_is_recalled_on_the_first_turn_and_every_profile_frequency_turns(api, tmp_path):
     (tmp_path / "supermemory.json").write_text(json.dumps({"profile_frequency": 3}))
-    provider = make_provider(tmp_path)
+    provider = settle(make_provider(tmp_path))
     recalled = []
     for turn in range(1, 7):
         provider.on_turn_start(turn, "hi")
@@ -622,6 +629,46 @@ def test_recall_skips_memories_already_injected_until_compaction(api, tmp_path):
 
 
 def test_recall_block_has_no_intro_and_a_capped_query(api, tmp_path):
-    text = make_provider(tmp_path).prefetch("x" * 5000)
+    text = settle(make_provider(tmp_path)).prefetch("x" * 5000)
     assert text.startswith("<supermemory-context>\n# Profile")
     assert [len(r["body"]["query"]) for r in api.requests if r["path"].endswith("/search")] == [2000]
+
+
+def test_only_the_search_blocks_the_turn_and_the_profile_returns_after_compaction(api, tmp_path):
+    provider = settle(make_provider(tmp_path))
+    before = len(api.requests)
+    provider.on_turn_start(1, "email?")
+    assert "Morgan runs a bakery" in provider.prefetch("email?")
+    assert [r["path"] for r in api.requests[before:]] == ["/ns/hermes/search"]
+    provider.on_turn_start(2, "and?")
+    assert "Morgan runs a bakery" not in provider.prefetch("and?")
+    provider.on_session_switch("session-1", reason="compression")
+    provider.on_turn_start(3, "and now?")
+    assert "Morgan runs a bakery" in provider.prefetch("and now?")
+
+
+def test_queue_prefetch_refreshes_the_profile_before_it_is_due(api, tmp_path):
+    (tmp_path / "supermemory.json").write_text(json.dumps({"profile_frequency": 2}))
+    provider = settle(make_provider(tmp_path))
+    profiles = lambda: sum(r["path"].endswith("/profile") for r in api.requests)
+    provider.on_turn_start(1, "q")
+    provider.prefetch("q")
+    settle(provider).queue_prefetch("q")
+    settle(provider)
+    assert profiles() == 2
+    provider.on_turn_start(2, "q")
+    provider.prefetch("q")
+    settle(provider).queue_prefetch("q")
+    assert profiles() == 2
+
+
+def test_recall_status_counts_the_last_prefetch(api, tmp_path):
+    from agent.memory_manager import MemoryManager
+
+    manager = MemoryManager()
+    manager.add_provider(settle(make_provider(tmp_path)))
+    assert manager.prefetch_all("email?", session_id="session-1")
+    assert manager.describe_recall() == "🧠 Supermemory — recalled 1 memory"
+    manager.providers[0].on_turn_start(2, "again")
+    assert manager.prefetch_all("email again?", session_id="session-1") == ""
+    assert manager.describe_recall() == ""

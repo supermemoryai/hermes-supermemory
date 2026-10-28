@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import MemoryProvider, RecallStatus
 from agent.secret_scope import get_secret
 from tools.registry import tool_error
 
@@ -38,6 +38,7 @@ _INJECTED_BLOCK_RE = re.compile(r"<supermemory-(context|containers)>[\s\S]*?</su
 _DATA_URI_RE = re.compile(r"data:[^;,\s]+;base64,[A-Za-z0-9+/=]+")  # pasted inline images are useless as memory text
 _READ_WINDOW_CHARS = 8000
 _MAX_QUERY_CHARS = 2000
+_MAX_CACHED_PROFILES = 64
 _MAX_PENDING_DOCS = 50
 _MAX_PENDING_BYTES = 256 * 1024
 _SUMMARY_END = "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
@@ -187,8 +188,8 @@ def _similarity_pct(value: Any) -> Optional[int]:
     return _quietly(lambda: None if value is None else round(float(value) * 100))
 
 
-def _format_prefetch_context(profile: str, search_results: list, max_results: int) -> str:
-    """The markdown profile, then up to ``max_results`` search hits not already in it."""
+def _format_prefetch_context(profile: str, search_results: list, max_results: int) -> tuple:
+    """The markdown profile, then up to ``max_results`` search hits not already in it, and how many hits made it in."""
     seen: set = set()
 
     def _unique(items, key=lambda x: x):  # set.add() returns None, so `not seen.add(k)` records k and keeps the item
@@ -201,7 +202,7 @@ def _format_prefetch_context(profile: str, search_results: list, max_results: in
         pct = _similarity_pct(item.get("similarity"))
         lines.append(f"- {' '.join(([f'[{rel}]'] if rel else []) + ([f'[{pct}%]'] if pct is not None else []))} {item['memory']}".strip())
     sections += ["## Relevant Memories\n" + "\n".join(lines)] if lines else []
-    return "<supermemory-context>\n" + "\n\n".join(sections) + "\n</supermemory-context>" if sections else ""
+    return ("<supermemory-context>\n" + "\n\n".join(sections) + "\n</supermemory-context>" if sections else "", len(lines))
 
 
 def _clean_text_for_capture(text: str) -> str:
@@ -463,6 +464,10 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._container_tag, self._write_enabled, self._active = _DEFAULT_CONTAINER_TAG, True, False
         self._base_tag, self._platform, self._user_id, self._chat_id, self._speaker = _DEFAULT_CONTAINER_TAG, "", "", "", ""
         self._per_speaker, self._unsent_appends, self._recalled_ids = False, [], set()
+        self._profiles: Dict[str, str] = {}
+        self._profile_jobs: Dict[str, threading.Thread] = {}
+        self._profile_shown: set = set()
+        self._last_recall: Optional[RecallStatus] = None
         self._write_thread = None
         self._turn_count = 0
         self._reset_capture("")
@@ -541,6 +546,9 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._client = _quietly(lambda: _build_client(self._api_key, config, self._container_tag),
                                 "Supermemory initialization failed", level=logging.WARNING) if self._api_key else None
         self._active = self._client is not None
+        self._profiles, self._profile_jobs, self._profile_shown, self._last_recall = {}, {}, set(), None
+        if self._active and self._auto_recall:
+            self._refresh_profile(self._container_tag)
         if self._active:
             self._warn_legacy_tags_once([raw_tag] + (config["custom_containers"] if self._enable_custom_containers else []))
 
@@ -584,27 +592,54 @@ class SupermemoryMemoryProvider(MemoryProvider):
     def _can_write(self) -> bool:
         return bool(self._active and self._write_enabled and self._client)
 
+    # Shown once per context window (again after a compaction) and every profile_frequency turns.
+    def _profile_due(self, tag: str, turn: int) -> bool:
+        return tag not in self._profile_shown or (turn > 0 and turn % self._profile_frequency == 0)
+
+    def _refresh_profile(self, tag: str) -> None:
+        if (job := self._profile_jobs.get(tag)) and job.is_alive():
+            return
+
+        def fetch() -> None:
+            profile = _quietly(lambda: self._client.get_profile(container_tag=tag, timeout=self._api_timeout), "Supermemory profile refresh failed")
+            if profile is not None:
+                self._profiles.pop(tag, None)
+                self._profiles[tag] = profile
+                while len(self._profiles) > _MAX_CACHED_PROFILES:
+                    self._profiles.pop(next(iter(self._profiles)))
+        self._profile_jobs[tag] = job = spawn_context_thread(fetch, name="supermemory-profile")
+        job.start()
+
+    # Only the search blocks the turn; the profile comes from the cache that queue_prefetch keeps fresh.
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        self._last_recall = None
         if not self._active or not self._auto_recall or not self._client or not query.strip():
             return ""
-        # Profile and search run in parallel, each bounded by api_timeout; either one failing leaves the other.
         tag = self._speaker_tag(self._speaker)
-        jobs = {"search": lambda: self._client.search_memories(query, limit=self._max_recall_results, container_tag=tag, search_mode="memories",
-                                                               threshold=self._threshold, timeout=self._api_timeout)}
-        if self._turn_count <= 1 or self._turn_count % self._profile_frequency == 0:
-            jobs["profile"] = lambda: self._client.get_profile(container_tag=tag, timeout=self._api_timeout)
-        found: Dict[str, Any] = {}
-        threads = [spawn_context_thread(lambda k=k, fn=fn: found.__setitem__(k, _quietly(fn, "Supermemory recall (%s) failed", k)),
-                                        name=f"supermemory-recall-{k}") for k, fn in jobs.items()]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(self._api_timeout + 0.5)
-        hits = [hit for hit in found.get("search") or [] if hit.get("id") not in self._recalled_ids]
-        text = _quietly(lambda: _format_prefetch_context(found.get("profile") or "", hits, self._max_recall_results),
-                        "Supermemory prefetch failed", default="")
-        self._recalled_ids.update(hit["id"] for hit in hits if text and hit.get("id"))
+        due = self._profile_due(tag, self._turn_count)
+        if due and tag not in self._profiles:
+            self._refresh_profile(tag)
+        found = _quietly(lambda: self._client.search_memories(query, limit=self._max_recall_results, container_tag=tag, search_mode="memories",
+                                                              threshold=self._threshold, timeout=self._api_timeout),
+                         "Supermemory recall failed", default=[])
+        hits = [hit for hit in found if hit.get("id") not in self._recalled_ids]
+        profile = self._profiles.get(tag, "") if due else ""
+        text, count = _quietly(lambda: _format_prefetch_context(profile, hits, self._max_recall_results),
+                               "Supermemory prefetch failed", default=("", 0))
+        if due and tag in self._profiles:
+            self._profile_shown.add(tag)
+        if text:
+            self._recalled_ids.update(hit["id"] for hit in hits if hit.get("id"))
+            self._last_recall = RecallStatus(provider_label="Supermemory", count=count)
         return text
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        tag = self._speaker_tag(self._speaker)
+        if self._active and self._auto_recall and self._client and self._profile_due(tag, self._turn_count + 1):
+            self._refresh_profile(tag)
+
+    def recall_status(self) -> Optional[RecallStatus]:
+        return self._last_recall
 
     def _reset_capture(self, session_id: str) -> None:
         self._doc_id, self._doc_session = _capture_doc_id(session_id), session_id
@@ -728,7 +763,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
     # Compaction continues the conversation and its document; a rewind needs nothing, the next transcript rewrites it.
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False, **kwargs) -> None:
         new_id = str(new_session_id or "").strip()
-        self._recalled_ids = set()
+        self._recalled_ids, self._profile_shown = set(), set()
         if kwargs.get("reason") == "compression":
             self._flush("session_switch")
             with self._capture_lock:
