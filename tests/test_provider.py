@@ -502,19 +502,23 @@ def test_long_session_ids_keep_document_ids_within_100_characters(api, tmp_path)
     assert len(doc_id) == 100 and doc_id.startswith("hermes_sss")
 
 
-def test_setup_reads_the_key_through_hermes_and_leaves_the_environment_alone(api, tmp_path, monkeypatch):
-    import hermes_cli.config
-    import hermes_cli.memory_setup
-
-    monkeypatch.setattr(hermes_cli.config, "save_config", lambda config: None)
-    monkeypatch.setattr(hermes_cli.memory_setup, "_prompt", lambda *a, **k: "")
+def test_status_reads_the_key_through_hermes_and_leaves_the_environment_alone(api, tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     seen = []
-    monkeypatch.setattr(sm, "get_secret", lambda name, default=None: seen.append(name) or "scoped-key")
+    monkeypatch.setattr(sm, "get_secret", lambda name, default=None: seen.append(name) or ("scoped-key" if name == "SUPERMEMORY_API_KEY" else default))
     before = dict(os.environ)
-    SupermemoryMemoryProvider().post_setup(str(tmp_path), {})
+    assert SupermemoryMemoryProvider().get_status_config({})["summary"].startswith("✓ Connected")
     assert "SUPERMEMORY_API_KEY" in seen and dict(os.environ) == before
     assert api.requests[-1]["headers"]["authorization"] == "Bearer scoped-key"
-    assert "os.environ" not in inspect.getsource(sm)
+    assert "os.environ" not in inspect.getsource(sm) and "hermes_cli.memory_setup" not in inspect.getsource(sm)
+
+
+def test_setup_wizard_writes_the_user_scope(tmp_path):
+    provider = SupermemoryMemoryProvider()
+    field = next(f for f in provider.get_config_schema() if f["key"] == "memory_scope")
+    assert field["default"] == "user" and set(field["choices"]) == {"user", "chat", "shared"}
+    provider.save_config({"memory_scope": field["default"]}, str(tmp_path))
+    assert sm._load_supermemory_config(str(tmp_path))["memory_scope"] == "user"
 
 
 def test_compaction_keeping_head_and_tail_stores_each_turn_once(api, tmp_path):
@@ -729,4 +733,46 @@ def test_store_leaves_the_callers_metadata_alone(api, tmp_path):
 def test_no_module_level_mutable_state():
     constants = {"_CONFIG_SPEC", "_KEBAB_ALIASES", "_ALIAS_TO_TOOL", "_BOOL_WORDS", "_BASE_SCHEMAS"}
     assert [n for n, v in vars(sm).items() if isinstance(v, (dict, list, set)) and n[:1] == "_" != n[1:2] and n not in constants] == []
+
+
+
+@pytest.mark.parametrize("legacy, panel, expected", [
+    ({"container_tag": "old", "auto_capture": False}, None, ("old", False)),
+    (None, {"container_tag": "panel", "auto_capture": False}, ("panel", False)),
+    ({"container_tag": "old", "auto_capture": False}, {"container_tag": "panel", "auto_capture": True}, ("panel", True)),
+], ids=["supermemory.json", "panel", "panel-wins"])
+def test_both_config_files_are_read(tmp_path, legacy, panel, expected):
+    if legacy:
+        (tmp_path / "supermemory.json").write_text(json.dumps(legacy))
+    if panel:
+        (tmp_path / "supermemory").mkdir()
+        (tmp_path / "supermemory" / "config.json").write_text(json.dumps(panel))
+    config = sm._load_supermemory_config(str(tmp_path))
+    assert (config["container_tag"], config["auto_capture"]) == expected
+
+
+def test_panel_schema_loads_and_saves_through_the_hermes_dashboard(tmp_path, monkeypatch):
+    import shutil
+    from pathlib import Path
+
+    from hermes_cli.web_routers import memory_providers
+    from plugins.memory.config_schema import get_provider_config_schema
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    root = Path(sm.__file__).parent
+    plugin = tmp_path / "plugins" / "supermemory"
+    shutil.copytree(root, plugin, ignore=shutil.ignore_patterns("tests", ".git", "__pycache__"))
+    schema = get_provider_config_schema("supermemory")
+    assert schema is not None and schema.name == "supermemory" and schema.storage == "flat_json"
+    payload = memory_providers._declared_provider_payload(schema)
+    assert {f["key"]: f["value"] for f in payload["fields"]}["memory_scope"] == "user"
+    monkeypatch.setattr(memory_providers, "save_env_value", lambda key, value: None)
+    monkeypatch.setattr(memory_providers, "save_config", lambda config: None)
+    memory_providers._update_memory_provider_config(schema, {f["key"]: f["value"] for f in payload["fields"]})
+    config = sm._load_supermemory_config(str(tmp_path))
+    assert (config["memory_scope"], config["container_tag"], config["threshold"]) == ("user", "hermes", 0.5)
+
+
+def test_compat_block_is_gone():
+    assert not any(hasattr(sm, name) for name in ("STORE_SCHEMA", "SEARCH_SCHEMA", "FORGET_SCHEMA", "PROFILE_SCHEMA"))
 

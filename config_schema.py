@@ -1,0 +1,83 @@
+"""Supermemory's config panel in the Hermes dashboard and Desktop; values land in $HERMES_HOME/supermemory/config.json."""
+
+from plugins.memory.config_schema import (
+    KIND_BOOL,
+    KIND_NUMBER,
+    KIND_SECRET,
+    KIND_SELECT,
+    KIND_TEXT,
+    ProviderConfigSchema,
+    ProviderField,
+    ProviderFieldOption,
+)
+
+CONFIG_SCHEMA = ProviderConfigSchema(
+    name="supermemory",
+    label="Supermemory",
+    docs_url="https://github.com/supermemoryai/hermes-supermemory#config",
+    fields=(
+        ProviderField(
+            key="api_key",
+            label="API key",
+            kind=KIND_SECRET,
+            env_key="SUPERMEMORY_API_KEY",
+            placeholder="Enter Supermemory API key",
+            description="From console.supermemory.ai/keys.",
+            inline=True,
+        ),
+        ProviderField(
+            key="container_tag",
+            label="Container tag",
+            kind=KIND_TEXT,
+            placeholder="hermes",
+            description="Where memories are stored. {identity} becomes the Hermes profile name.",
+            inline=True,
+        ),
+        ProviderField(
+            key="memory_scope",
+            label="Gateway memory scope",
+            kind=KIND_SELECT,
+            default="user",
+            description="For gateway bots. CLI and Desktop always use the container tag.",
+            options=(
+                ProviderFieldOption("user", "Per user", "Each person gets their own memory"),
+                ProviderFieldOption("chat", "Per chat", "Each conversation gets its own memory"),
+                ProviderFieldOption("shared", "Shared", "Everyone shares one memory"),
+            ),
+            inline=True,
+        ),
+        ProviderField(key="auto_recall", label="Recall before each turn", kind=KIND_BOOL, default="true", inline=True),
+        ProviderField(key="auto_capture", label="Save conversations", kind=KIND_BOOL, default="true", inline=True),
+        ProviderField(key="max_recall_results", label="Memories per turn", kind=KIND_NUMBER, placeholder="10",
+                      description="1 to 20.", group="Search"),
+        ProviderField(
+            key="search_mode",
+            label="Search tool mode",
+            kind=KIND_SELECT,
+            default="hybrid",
+            options=(
+                ProviderFieldOption("hybrid", "Hybrid", "Memories and document excerpts"),
+                ProviderFieldOption("memories", "Memories", "Memories only"),
+                ProviderFieldOption("chunks", "Chunks", "Document excerpts only"),
+            ),
+            group="Search",
+        ),
+        ProviderField(key="threshold", label="Minimum similarity", kind=KIND_NUMBER, placeholder="0.5",
+                      description="0 to 1. Higher returns fewer, closer matches.", group="Search"),
+        ProviderField(
+            key="rerank",
+            label="Rerank",
+            kind=KIND_SELECT,
+            default="none",
+            options=(ProviderFieldOption("none", "None"), ProviderFieldOption("order", "Reorder by relevance")),
+            group="Search",
+        ),
+        ProviderField(key="rewrite_query", label="Rewrite queries", kind=KIND_BOOL, default="false",
+                      description="Better recall for vague prompts; about 400 ms slower.", group="Search"),
+        ProviderField(key="include_documents", label="Include source documents", kind=KIND_BOOL, default="false", group="Search"),
+        ProviderField(key="include_related", label="Include related memories", kind=KIND_BOOL, default="false", group="Search"),
+        ProviderField(key="include_forgotten", label="Include forgotten memories", kind=KIND_BOOL, default="false", group="Search"),
+        ProviderField(key="allow_agent_search_overrides", label="Let the agent pick search options", kind=KIND_BOOL, default="true",
+                      description="Off keeps the search tool on these settings.", group="Search"),
+    ),
+)

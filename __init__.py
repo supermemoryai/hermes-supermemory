@@ -154,10 +154,10 @@ def _read_json_dict(path: Path) -> dict:
 
 
 def _load_supermemory_config(hermes_home: Optional[str] = None) -> dict:
-    """Defaults overlaid with $hermes_home/supermemory.json (None = defaults only), every key normalized."""
+    """Defaults, then $hermes_home/supermemory.json, then the config panel's supermemory/config.json (None = defaults only)."""
     config = {k: (list(d) if isinstance(d, list) else d) for k, (d, _) in _CONFIG_SPEC.items()}
-    if hermes_home is not None:
-        config.update({k: v for k, v in _read_json_dict(Path(hermes_home) / "supermemory.json").items() if v is not None})
+    for path in (("supermemory.json",), ("supermemory", "config.json")) if hermes_home is not None else ():
+        config.update({k: v for k, v in _read_json_dict(Path(hermes_home).joinpath(*path)).items() if v is not None})
     for key, (_, normalize) in _CONFIG_SPEC.items():
         config[key] = normalize(config[key])
     return config
@@ -526,24 +526,6 @@ class SupermemoryMemoryProvider(MemoryProvider):
     def get_status_config(self, provider_config: dict) -> dict:
         from hermes_constants import get_hermes_home
         return {"summary": _format_connection_summary(_probe_supermemory_connection(get_secret("SUPERMEMORY_API_KEY", "") or "", str(get_hermes_home())))}
-
-    def post_setup(self, hermes_home: str, config: dict) -> None:
-        from hermes_cli.config import save_config
-        from hermes_cli.memory_setup import _prompt, _write_env_vars
-        print(f"\n  Configuring supermemory:\n\n  Get your API key at {_API_KEY_URL}\n")
-        existing = get_secret("SUPERMEMORY_API_KEY", "") or ""
-        masked = f"...{existing[-4:]}" if len(existing) > 4 else "set"
-        val = _prompt(f"Supermemory API key (current: {masked}, blank to keep)" if existing else "Supermemory API key", secret=True)
-        memory = config["memory"] = config["memory"] if isinstance(config.get("memory"), dict) else {}
-        memory["provider"] = self.name
-        save_config(config)
-        if val:
-            _write_env_vars({"SUPERMEMORY_API_KEY": val}, hermes_home=hermes_home)
-        status = _probe_supermemory_connection(val or existing, hermes_home)
-        print(f"\n  {_format_connection_summary(status)}\n\n  Memory provider: supermemory\n  Activation saved to config.yaml")
-        if val:
-            print("  API keys saved to .env")
-        print("\n  Start a new session to activate.\n")
 
     def initialize(self, session_id: str, **kwargs) -> None:
         from hermes_constants import get_hermes_home
@@ -915,59 +897,3 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
 def register(ctx):
     ctx.register_memory_provider(SupermemoryMemoryProvider())
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-
-FORGET_SCHEMA = {
-    "name": "supermemory_forget",
-    "description": "Forget a memory by exact id or by best-match query.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "id": {"type": "string", "description": "Exact memory id to delete."},
-            "query": {"type": "string", "description": "Query used to find the memory to forget."},
-        },
-    },
-}
-
-PROFILE_SCHEMA = {
-    "name": "supermemory_profile",
-    "description": "Retrieve the user's profile: persistent facts and recent memory context.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "Optional query; matching memories are returned alongside the profile."},
-        },
-    },
-}
-
-SEARCH_SCHEMA = {
-    "name": "supermemory_search",
-    "description": "Search long-term memory by semantic similarity.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "What to search for."},
-            "limit": {"type": "integer", "description": "Maximum results to return, 1 to 20."},
-        },
-        "required": ["query"],
-    },
-}
-
-STORE_SCHEMA = {
-    "name": "supermemory_store",
-    "description": "Store an explicit memory for future recall.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "content": {"type": "string", "description": "The memory content to store."},
-            "metadata": {"type": "object", "description": "Optional metadata attached to the memory."},
-        },
-        "required": ["content"],
-    },
-}
-# ---- END PLUGIN-COMPAT ----

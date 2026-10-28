@@ -46,7 +46,7 @@ the endpoint first ensures the setup connection probe also stays local.
 
 ## Config
 
-Config file: `$HERMES_HOME/supermemory.json`
+Config files: `$HERMES_HOME/supermemory.json`, and `$HERMES_HOME/supermemory/config.json`, which the config panel in the Hermes dashboard and Desktop writes. A value set in the panel wins.
 
 | Key | Default | Description |
 |-----|---------|-------------|
