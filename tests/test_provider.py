@@ -225,7 +225,7 @@ def test_recall_is_full_profile_plus_search(api, tmp_path):
     assert "## Relevant Memories\n- [91%] Morgan prefers email" in text
     search = next(r for r in api.requests if r["path"].endswith("/search"))
     assert search["path"] == "/ns/hermes/search"
-    assert search["body"] == {"query": "Book the usual table", "limit": 10, "searchMode": "hybrid"}
+    assert search["body"] == {"query": "Book the usual table", "limit": 10, "searchMode": "memories", "threshold": 0.5}
     assert search["headers"]["x-sm-source"] == "hermes" and search["headers"]["authorization"] == "Bearer test-key"
     profile = next(r for r in api.requests if r["path"].endswith("/profile"))
     assert profile["path"] == "/ns/hermes/profile" and profile["headers"]["accept"] == "text/markdown"
@@ -247,11 +247,10 @@ def test_recalled_context_is_not_captured(api, tmp_path):
 def test_tools_and_kebab_aliases(api, tmp_path):
     provider = make_provider(tmp_path)
     schemas = provider.get_tool_schemas()
-    assert "query" in next(s for s in schemas if s["name"] == "supermemory_profile")["parameters"]["properties"]
+    assert "query" in next(s for s in schemas if s["name"] == "supermemory-profile")["parameters"]["properties"]
     names = [s["name"] for s in schemas]
-    assert names == ["supermemory_store", "supermemory_search", "supermemory_forget", "supermemory_profile",
-                     "supermemory_read_document", "supermemory-save", "supermemory-search", "supermemory-forget",
-                     "supermemory-profile", "supermemory-read-document"]
+    assert names == ["supermemory-save", "supermemory-search", "supermemory-forget", "supermemory-profile", "supermemory-read-document"]
+    assert "supermemory_search" not in provider.system_prompt_block()
     saved = json.loads(provider.handle_tool_call("supermemory-save", {"content": "The shop is closed on Sundays."}))
     assert saved["saved"] is True
     store = api.writes()[-1]["body"]
@@ -604,3 +603,25 @@ def test_identity_signature_follows_the_scope(tmp_path, monkeypatch):
     assert SupermemoryMemoryProvider().identity_signature() == {"supermemory.memory_scope": "shared"}
     scope(tmp_path, "chat")
     assert SupermemoryMemoryProvider().identity_signature() == {"supermemory.memory_scope": "chat"}
+
+
+def test_snake_case_names_are_still_handled(api, tmp_path):
+    provider = make_provider(tmp_path)
+    for snake, kebab in sm._KEBAB_ALIASES.items():
+        args = {"content": "x", "query": "x", "document_id": "d1"}
+        assert "Unknown tool" not in provider.handle_tool_call(snake, args)
+        assert "Unknown tool" not in provider.handle_tool_call(kebab, args)
+
+
+def test_recall_skips_memories_already_injected_until_compaction(api, tmp_path):
+    provider = make_provider(tmp_path)
+    assert "Morgan prefers email" in provider.prefetch("email?")
+    assert "Morgan prefers email" not in provider.prefetch("email again?")
+    provider.on_session_switch("session-1", reason="compression")
+    assert "Morgan prefers email" in provider.prefetch("email once more?")
+
+
+def test_recall_block_has_no_intro_and_a_capped_query(api, tmp_path):
+    text = make_provider(tmp_path).prefetch("x" * 5000)
+    assert text.startswith("<supermemory-context>\n# Profile")
+    assert [len(r["body"]["query"]) for r in api.requests if r["path"].endswith("/search")] == [2000]

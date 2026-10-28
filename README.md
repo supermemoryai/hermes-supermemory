@@ -56,6 +56,7 @@ Config file: `$HERMES_HOME/supermemory.json`
 | `auto_recall` | `true` | Inject relevant memory context before turns |
 | `auto_capture` | `true` | Store cleaned user-assistant turns after each response |
 | `max_recall_results` | `10` | Max search results recalled with the profile (1-20) |
+| `threshold` | `0.5` | Minimum similarity (0-1) for a recalled memory. Automatic recall searches memories only; the search tool uses `search_mode` |
 | `profile_frequency` | `50` | Include profile facts on the first turn and every N turns |
 | `capture_mode` | `all` | Skip tiny or trivial turns by default |
 | `search_mode` | `hybrid` | Search mode: `hybrid`, `memories` (memories only), `chunks` (document excerpts only; `documents` is accepted as before) |
@@ -87,7 +88,7 @@ for SDK operations and setup/status probes.
 
 ## Tools
 
-Kebab-case names are registered for the agent; snake_case aliases remain supported.
+Only the kebab-case names are sent to the model; calls using the snake_case names still work.
 
 | Tool | Alias | Description |
 |------|-------|-------------|

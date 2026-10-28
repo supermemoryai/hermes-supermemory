@@ -37,6 +37,7 @@ _API_KEY_URL = "https://console.supermemory.ai/keys?create=true"
 _INJECTED_BLOCK_RE = re.compile(r"<supermemory-(context|containers)>[\s\S]*?</supermemory-\1>\s*", re.DOTALL)
 _DATA_URI_RE = re.compile(r"data:[^;,\s]+;base64,[A-Za-z0-9+/=]+")  # pasted inline images are useless as memory text
 _READ_WINDOW_CHARS = 8000
+_MAX_QUERY_CHARS = 2000
 _MAX_PENDING_DOCS = 50
 _MAX_PENDING_BYTES = 256 * 1024
 _SUMMARY_END = "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
@@ -52,7 +53,6 @@ _DEFAULT_ENTITY_CONTEXT = (
     "Do not remember temporary intents, one-time tasks, assistant actions, implementation details, or in-progress status.\n\n"
     "When in doubt, store less."
 )
-# snake_case tool name -> kebab-case alias exposed alongside it.
 _KEBAB_ALIASES = {"supermemory_store": "supermemory-save", "supermemory_search": "supermemory-search",
                   "supermemory_forget": "supermemory-forget", "supermemory_profile": "supermemory-profile",
                   "supermemory_read_document": "supermemory-read-document"}
@@ -129,6 +129,7 @@ _CONFIG_SPEC: Dict[str, tuple] = {
     "auto_recall": (True, lambda v: _as_bool(v, True)),
     "auto_capture": (True, lambda v: _as_bool(v, True)),
     "max_recall_results": (10, lambda v: _clamp_number(v, 10, 1, 20, int)),
+    "threshold": (0.5, lambda v: _clamp_number(v, 0.5, 0.0, 1.0, float)),
     "profile_frequency": (50, lambda v: _clamp_number(v, 50, 1, 500, int)),
     "capture_mode": ("all", lambda v: "everything" if v == "everything" else "all"),
     "search_mode": ("hybrid", _search_mode),
@@ -200,8 +201,7 @@ def _format_prefetch_context(profile: str, search_results: list, max_results: in
         pct = _similarity_pct(item.get("similarity"))
         lines.append(f"- {' '.join(([f'[{rel}]'] if rel else []) + ([f'[{pct}%]'] if pct is not None else []))} {item['memory']}".strip())
     sections += ["## Relevant Memories\n" + "\n".join(lines)] if lines else []
-    intro = "The following is background context from long-term memory. Use it silently when relevant. Do not force memories into the conversation."
-    return f"<supermemory-context>\n{intro}\n\n" + "\n\n".join(sections) + "\n</supermemory-context>" if sections else ""
+    return "<supermemory-context>\n" + "\n\n".join(sections) + "\n</supermemory-context>" if sections else ""
 
 
 def _clean_text_for_capture(text: str) -> str:
@@ -294,10 +294,12 @@ class _SupermemoryClient:
                            for i in ids)
 
     def search_memories(self, query: str, *, limit: int = 5, container_tag: Optional[str] = None,
-                        search_mode: Optional[str] = None, timeout: Optional[float] = None) -> list[dict]:
+                        search_mode: Optional[str] = None, threshold: Optional[float] = None,
+                        timeout: Optional[float] = None) -> list[dict]:
         mode = search_mode or self._search_mode
-        response = self._client.search(container_tag or self._container_tag, query=query, limit=limit,
+        response = self._client.search(container_tag or self._container_tag, query=query[:_MAX_QUERY_CHARS], limit=limit,
                                        **({"search_mode": mode} if mode in _VALID_SEARCH_MODES else {}),
+                                       **({"threshold": threshold} if threshold is not None else {}),
                                        **({"timeout": timeout} if timeout else {}))
         return [_result_fields(item) for item in _as_dict(response).get("results") or []]
 
@@ -426,7 +428,6 @@ def _format_connection_summary(status: dict) -> str:
     return f"✗ {status.get('error') or 'connection failed'} · container: {container} · {flags}"
 
 
-# (name, description, ((prop, type, description), ...), required) -> tool schema; kebab aliases are added in get_tool_schemas().
 _BASE_SCHEMAS = [
     {"name": name, "description": description,
      "parameters": {"type": "object", "properties": {p: {"type": t, "description": d} for p, t, d in props}, **({"required": req} if req else {})}}
@@ -461,7 +462,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._client: Optional[_SupermemoryClient] = None
         self._container_tag, self._write_enabled, self._active = _DEFAULT_CONTAINER_TAG, True, False
         self._base_tag, self._platform, self._user_id, self._chat_id, self._speaker = _DEFAULT_CONTAINER_TAG, "", "", "", ""
-        self._per_speaker, self._unsent_appends = False, []
+        self._per_speaker, self._unsent_appends, self._recalled_ids = False, [], set()
         self._write_thread = None
         self._turn_count = 0
         self._reset_capture("")
@@ -471,7 +472,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._base_url, self._allowed_containers = _DEFAULT_BASE_URL, []  # env var is only consulted in initialize()
 
     def _apply_config(self, config: dict) -> None:
-        for key in ("auto_recall", "auto_capture", "max_recall_results", "profile_frequency", "capture_mode",
+        for key in ("auto_recall", "auto_capture", "max_recall_results", "threshold", "profile_frequency", "capture_mode",
                     "search_mode", "entity_context", "dreaming", "api_timeout", "custom_container_instructions"):
             setattr(self, f"_{key}", config[key])
         self._custom_containers = [_sanitize_tag(t) for t in config["custom_containers"]]
@@ -532,7 +533,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         raw_tag = _expand_container_tag(config["container_tag"], kwargs.get("agent_identity", "default"))
         self._base_tag = _sanitize_tag(raw_tag)
         self._platform, self._user_id, self._chat_id = (str(kwargs.get(k) or "").strip() for k in ("platform", "user_id", "chat_id"))
-        self._speaker, self._unsent_appends = "", []
+        self._speaker, self._unsent_appends, self._recalled_ids = "", [], set()
         self._container_tag = _scoped_tag(self._base_tag, config["memory_scope"], self._platform, self._user_id, self._chat_id)
         self._per_speaker = config["memory_scope"] == "user" and bool(self._user_id) and str(kwargs.get("chat_type") or "dm") != "dm"
         self._apply_config(config)
@@ -573,10 +574,10 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
     def system_prompt_block(self) -> str:
         lines = ["# Supermemory", f"Active. Container: {self._container_tag}.",
-                 "Use supermemory-search, supermemory-save, supermemory-forget, supermemory-profile, and supermemory-read-document (aliases: supermemory_search, supermemory_store, supermemory_forget, supermemory_profile, supermemory_read_document)."]
+                 "Use supermemory-search, supermemory-save, supermemory-forget, supermemory-profile, and supermemory-read-document."]
         if self._enable_custom_containers and self._custom_containers:
             lines += [f"\nMulti-container mode enabled. Available containers: {', '.join(self._allowed_containers)}.",
-                      "Pass an optional container_tag to supermemory_search, supermemory_store, supermemory_forget, supermemory_profile, and supermemory_read_document to target a specific container."]
+                      "Pass an optional container_tag to any supermemory tool to target a specific container."]
             lines += [f"\n{self._custom_container_instructions}"] if self._custom_container_instructions else []
         return "\n".join(lines) if self._active else ""
 
@@ -588,7 +589,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
             return ""
         # Profile and search run in parallel, each bounded by api_timeout; either one failing leaves the other.
         tag = self._speaker_tag(self._speaker)
-        jobs = {"search": lambda: self._client.search_memories(query, limit=self._max_recall_results, container_tag=tag, timeout=self._api_timeout)}
+        jobs = {"search": lambda: self._client.search_memories(query, limit=self._max_recall_results, container_tag=tag, search_mode="memories",
+                                                               threshold=self._threshold, timeout=self._api_timeout)}
         if self._turn_count <= 1 or self._turn_count % self._profile_frequency == 0:
             jobs["profile"] = lambda: self._client.get_profile(container_tag=tag, timeout=self._api_timeout)
         found: Dict[str, Any] = {}
@@ -598,8 +600,11 @@ class SupermemoryMemoryProvider(MemoryProvider):
             thread.start()
         for thread in threads:
             thread.join(self._api_timeout + 0.5)
-        return _quietly(lambda: _format_prefetch_context(found.get("profile") or "", found.get("search") or [], self._max_recall_results),
+        hits = [hit for hit in found.get("search") or [] if hit.get("id") not in self._recalled_ids]
+        text = _quietly(lambda: _format_prefetch_context(found.get("profile") or "", hits, self._max_recall_results),
                         "Supermemory prefetch failed", default="")
+        self._recalled_ids.update(hit["id"] for hit in hits if text and hit.get("id"))
+        return text
 
     def _reset_capture(self, session_id: str) -> None:
         self._doc_id, self._doc_session = _capture_doc_id(session_id), session_id
@@ -723,6 +728,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
     # Compaction continues the conversation and its document; a rewind needs nothing, the next transcript rewrites it.
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False, **kwargs) -> None:
         new_id = str(new_session_id or "").strip()
+        self._recalled_ids = set()
         if kwargs.get("reason") == "compression":
             self._flush("session_switch")
             with self._capture_lock:
@@ -760,8 +766,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         for schema in schemas if self._enable_custom_containers else ():  # multi-container mode: every tool takes container_tag
             schema["parameters"]["properties"]["container_tag"] = {
                 "type": "string", "description": f"Optional container tag. Allowed: {', '.join(self._allowed_containers)}. Defaults to primary ({self._container_tag})."}
-        # Kebab-case aliases are appended after all snake_case schemas (deep-copied, name swapped).
-        return schemas + [{**json.loads(json.dumps(s)), "name": _KEBAB_ALIASES[s["name"]]} for s in schemas]
+        return [{**s, "name": _KEBAB_ALIASES[s["name"]]} for s in schemas]
 
     def _tool_container_tag(self, args: dict) -> Optional[str]:
         """Validated container_tag from args; None = primary. Raises _TagError when not whitelisted."""
@@ -841,7 +846,6 @@ class SupermemoryMemoryProvider(MemoryProvider):
             return tool_error(str(exc) if isinstance(exc, _TagError) else f"{fail_prefix}: {exc}")
         return resp if isinstance(resp, str) else json.dumps(resp)
 
-    # snake_case tool name -> (handler, error prefix); kebab aliases are folded in via _ALIAS_TO_TOOL first.
     _TOOL_HANDLERS = {"supermemory_store": (_tool_store, "Failed to store memory"), "supermemory_search": (_tool_search, "Search failed"),
                       "supermemory_forget": (_tool_forget, "Forget failed"), "supermemory_profile": (_tool_profile, "Profile failed"),
                       "supermemory_read_document": (_tool_read_document, "Read failed")}
