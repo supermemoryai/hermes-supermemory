@@ -52,6 +52,7 @@ Config file: `$HERMES_HOME/supermemory.json`
 |-----|---------|-------------|
 | `base_url` | `https://api.supermemory.ai` | API endpoint for hosted or self-hosted Supermemory. Takes priority over `SUPERMEMORY_BASE_URL`. |
 | `container_tag` | `hermes` | Container tag (namespace) used for search and writes. Supports `{identity}` template for profile-scoped tags (e.g. `hermes-{identity}` → `hermes-coder`). Letters, digits, `_`, `-` and `:` are kept; other characters become `_`. Tags over 100 characters are shortened to 100, ending in `_` and an 8-character hash of the full tag so they stay distinct. |
+| `memory_scope` | `shared` | Gateway bots only: `user` gives each person their own container, `chat` each conversation, `shared` one for everyone. CLI and Desktop always use `container_tag`. New setups choose `user`. |
 | `auto_recall` | `true` | Inject relevant memory context before turns |
 | `auto_capture` | `true` | Store cleaned user-assistant turns after each response |
 | `max_recall_results` | `10` | Max search results recalled with the profile (1-20) |
@@ -61,6 +62,10 @@ Config file: `$HERMES_HOME/supermemory.json`
 | `entity_context` | built-in default | Extraction guidance passed to Supermemory |
 | `dreaming` | `dynamic` | `dynamic` groups related conversations before forming memories; `instant` processes each one right away (billed as one extra operation) |
 | `api_timeout` | `5.0` | Timeout for SDK requests |
+
+### Gateway memory scope
+
+Existing bots keep `shared`, so every user shares one container. To switch, set `"memory_scope": "user"` in `supermemory.json`; memories saved while shared stay in the old container.
 
 ### Upgrading from 1.0.1
 

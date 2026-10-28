@@ -108,7 +108,7 @@ def api(monkeypatch, tmp_path):
 
 def make_provider(home, session_id="session-1", **kwargs):
     provider = SupermemoryMemoryProvider()
-    provider.initialize(session_id, hermes_home=str(home), platform="cli", **kwargs)
+    provider.initialize(session_id, hermes_home=str(home), **{"platform": "cli", **kwargs})
     return provider
 
 
@@ -538,3 +538,69 @@ def test_undo_after_a_failed_write_rewrites_the_shorter_snapshot(api, tmp_path):
     provider.on_session_switch("session-2", reset=True)
     provider.shutdown()
     assert api.captures() == {"hermes_session-1": TURN1} and provider._pending == {}
+
+
+GATEWAY = {"platform": "telegram", "user_id": "42", "chat_id": "-100", "chat_type": "dm"}
+
+
+def scope(home, value):
+    (home / "supermemory.json").write_text(json.dumps({"memory_scope": value}))
+
+
+def namespaces(api):
+    return {r["path"].split("/")[2] for r in api.requests}
+
+
+def test_existing_config_without_scope_stays_shared_and_tags_writes(api, tmp_path):
+    (tmp_path / "supermemory.json").write_text(json.dumps({"container_tag": "hermes"}))
+    provider = make_provider(tmp_path, **GATEWAY)
+    provider.prefetch("Book the usual table")
+    provider.sync_turn("Book the usual table", "Booked.", messages=transcript(("Book the usual table", "Booked.")))
+    provider.handle_tool_call("supermemory-save", {"content": "Closed on Sundays."})
+    assert namespaces(api) == {"hermes"}
+    assert all({"user_id": "42", "chat_id": "-100"}.items() <= w["body"]["metadata"].items() for w in api.writes())
+
+
+@pytest.mark.parametrize("value, ids, namespace", [
+    ("user", GATEWAY, "hermes:telegram:user:42"),
+    ("chat", GATEWAY, "hermes:telegram:chat:-100"),
+    ("user", {}, "hermes"),
+    ("chat", {"platform": "telegram", "user_id": "42"}, "hermes"),
+], ids=["user", "chat", "user-on-cli", "chat-without-chat-id"])
+def test_scope_picks_the_container(api, tmp_path, value, ids, namespace):
+    scope(tmp_path, value)
+    provider = make_provider(tmp_path, **ids)
+    provider.prefetch("Book the usual table")
+    provider.handle_tool_call("supermemory-search", {"query": "q"})
+    provider.sync_turn("Book the usual table", "Booked.", messages=transcript(("Book the usual table", "Booked.")))
+    assert namespaces(api) == {namespace}
+
+
+def test_scoped_names_are_platform_qualified_and_valid(api, tmp_path):
+    names = {sm._scoped_tag("hermes", "user", platform, uid, "")
+             for platform, uid in (("telegram", "42"), ("discord", "42"), ("matrix", "@a:b.org"), ("matrix", "@a:b_org"),
+                                   ("slack", "U" * 200))}
+    assert len(names) == 5
+    assert all(len(n) <= 100 and sm.re.fullmatch(r"[a-zA-Z0-9_:-]+", n) for n in names)
+
+
+def test_group_chat_files_each_speaker_under_that_speaker(api, tmp_path):
+    scope(tmp_path, "user")
+    provider = make_provider(tmp_path, **{**GATEWAY, "chat_type": "group"})
+    for author, user, reply in (("42", "Book the usual table", "Booked."), ("7", "And a cab at 7.", "Cab booked.")):
+        provider.on_turn_start(1, user, author_id=author, author_name=None, author_is_bot=False)
+        provider.prefetch(user)
+        provider.sync_turn(user, reply, messages=transcript((user, reply)), turn_author={"id": author, "name": None, "is_bot": False})
+    provider.on_session_end([])
+    searches = [r["path"] for r in api.requests if r["path"].endswith("/search")]
+    assert searches == ["/ns/hermes:telegram:user:42/search", "/ns/hermes:telegram:user:7/search"]
+    writes = [(w["path"], w["body"]["id"], w["body"]["content"], w["body"]["metadata"]["user_id"]) for w in api.writes()]
+    assert writes == [("/ns/hermes:telegram:user:42/document", "hermes_session-1", TURN1, "42"),
+                      ("/ns/hermes:telegram:user:7/document", "hermes_session-1", TURN2, "7")]
+
+
+def test_identity_signature_follows_the_scope(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert SupermemoryMemoryProvider().identity_signature() == {"supermemory.memory_scope": "shared"}
+    scope(tmp_path, "chat")
+    assert SupermemoryMemoryProvider().identity_signature() == {"supermemory.memory_scope": "chat"}

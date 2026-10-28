@@ -29,6 +29,7 @@ _DEFAULT_CONTAINER_TAG = "hermes"
 _MAX_TAG_LEN = 100
 _VALID_SEARCH_MODES = ("hybrid", "memories", "chunks")
 _VALID_DREAMING = ("dynamic", "instant")
+_VALID_SCOPES = ("shared", "user", "chat")
 _SDK_REQUIREMENT = "supermemory>=5.0.0,<6"
 _DEFAULT_BASE_URL = "https://api.supermemory.ai"
 _API_KEY_URL = "https://console.supermemory.ai/keys?create=true"
@@ -110,9 +111,21 @@ def _search_mode(value: Any) -> str:
     return mode if mode in _VALID_SEARCH_MODES else "hybrid"
 
 
+# Gateway ids can hold any character, so an id the charset would alter gets a hash of the original to stay distinct.
+def _scoped_tag(base: str, scope: str, platform: str, user_id: str, chat_id: str) -> str:
+    kind, raw = {"user": ("user", user_id), "chat": ("chat", chat_id)}.get(scope, ("", ""))
+    raw = str(raw or "").strip()
+    if not kind or not raw:
+        return base
+    part = re.sub(r"[^a-zA-Z0-9_:-]", "_", raw)
+    part = part if part == raw else f"{part}_{hashlib.sha256(raw.encode()).hexdigest()[:8]}"
+    return _cap_tag(f"{base}:{_sanitize_tag(platform or 'gateway')}:{kind}:{part}")
+
+
 # config key -> (default, normalizer). Tags stay raw here and are sanitized once applied, after {identity} expansion.
 _CONFIG_SPEC: Dict[str, tuple] = {
     "container_tag": (_DEFAULT_CONTAINER_TAG, lambda v: str(v).strip() or _DEFAULT_CONTAINER_TAG),
+    "memory_scope": ("shared", lambda v: v if (v := str(v or "").strip().lower()) in _VALID_SCOPES else "shared"),
     "auto_recall": (True, lambda v: _as_bool(v, True)),
     "auto_capture": (True, lambda v: _as_bool(v, True)),
     "max_recall_results": (10, lambda v: _clamp_number(v, 10, 1, 20, int)),
@@ -262,6 +275,14 @@ class _SupermemoryClient:
             self._client.documents.update(self._container_tag, urllib.parse.quote(doc_id, safe=""), **kwargs)
         except self._sm.NotFoundError:
             self._client.add(self._container_tag, id=doc_id, **kwargs)
+
+    # POST to an existing id appends, so each speaker's document grows one turn at a time without a read.
+    def append_document(self, doc_id: str, content: str, metadata: dict, *, container_tag: str, entity_context: str = "",
+                        dreaming: str = "") -> None:
+        self._client.add(container_tag, id=doc_id, content=content.strip(), date=datetime.now().astimezone().isoformat(timespec="seconds"),
+                         metadata=self._merge_metadata(metadata),
+                         **({"supporting_context": _clamp_entity_context(entity_context)} if entity_context else {}),
+                         **({"dreaming": dreaming} if dreaming else {}))
 
     # 1.0.x wrote a session as appended deltas in one document per 4-hour window, stamped with its session_id and no docId.
     def legacy_capture_text(self, session_id: str) -> str:
@@ -439,6 +460,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._api_key = self._session_id = self._hermes_home = ""
         self._client: Optional[_SupermemoryClient] = None
         self._container_tag, self._write_enabled, self._active = _DEFAULT_CONTAINER_TAG, True, False
+        self._base_tag, self._platform, self._user_id, self._chat_id, self._speaker = _DEFAULT_CONTAINER_TAG, "", "", "", ""
+        self._per_speaker, self._unsent_appends = False, []
         self._write_thread = None
         self._turn_count = 0
         self._reset_capture("")
@@ -464,9 +487,11 @@ class SupermemoryMemoryProvider(MemoryProvider):
         # importability here is a chicken-and-egg trap on sealed venvs. Mirrors honcho/mem0.
         return bool(get_secret("SUPERMEMORY_API_KEY", ""))
 
+    # A new setup scopes gateway memory per person; a config without memory_scope keeps the shared container.
     def get_config_schema(self):
-        # Only the API key is prompted during `hermes memory setup`; other options live in supermemory.json / env.
-        return [{"key": "api_key", "description": "Supermemory API key", "secret": True, "required": True, "env_var": "SUPERMEMORY_API_KEY", "url": _API_KEY_URL}]
+        return [{"key": "api_key", "description": "Supermemory API key", "secret": True, "required": True, "env_var": "SUPERMEMORY_API_KEY", "url": _API_KEY_URL},
+                {"key": "memory_scope", "description": "Gateway memory: one container per user, per chat, or shared by everyone",
+                 "choices": ["user", "chat", "shared"], "default": "user"}]
 
     def save_config(self, values, hermes_home):
         sanitized = dict(values or {})
@@ -505,7 +530,11 @@ class SupermemoryMemoryProvider(MemoryProvider):
         config = _load_supermemory_config(self._hermes_home)
         self._api_key = get_secret("SUPERMEMORY_API_KEY", "") or ""
         raw_tag = _expand_container_tag(config["container_tag"], kwargs.get("agent_identity", "default"))
-        self._container_tag = _sanitize_tag(raw_tag)
+        self._base_tag = _sanitize_tag(raw_tag)
+        self._platform, self._user_id, self._chat_id = (str(kwargs.get(k) or "").strip() for k in ("platform", "user_id", "chat_id"))
+        self._speaker, self._unsent_appends = "", []
+        self._container_tag = _scoped_tag(self._base_tag, config["memory_scope"], self._platform, self._user_id, self._chat_id)
+        self._per_speaker = config["memory_scope"] == "user" and bool(self._user_id) and str(kwargs.get("chat_type") or "dm") != "dm"
         self._apply_config(config)
         self._write_enabled = kwargs.get("agent_context", "") not in {"cron", "flush", "subagent"}
         self._client = _quietly(lambda: _build_client(self._api_key, config, self._container_tag),
@@ -528,6 +557,19 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         self._turn_count = max(turn_number, 0)
+        self._speaker = str(kwargs.get("author_id") or "").strip()
+
+    # Read on every inbound gateway message, so a scope change rebuilds cached agents.
+    def identity_signature(self) -> Dict[str, Any]:
+        from hermes_constants import get_hermes_home
+        return {"supermemory.memory_scope": _load_supermemory_config(str(get_hermes_home()))["memory_scope"]}
+
+    # In a group chat under the user scope, each speaker's turns and recall live in that speaker's container.
+    def _speaker_tag(self, author_id: str = "") -> str:
+        return _scoped_tag(self._base_tag, "user", self._platform, author_id, "") if self._per_speaker and author_id else self._container_tag
+
+    def _ids(self, author_id: str = "") -> Dict[str, str]:
+        return {k: v for k, v in (("user_id", author_id or self._user_id), ("chat_id", self._chat_id)) if v}
 
     def system_prompt_block(self) -> str:
         lines = ["# Supermemory", f"Active. Container: {self._container_tag}.",
@@ -545,9 +587,10 @@ class SupermemoryMemoryProvider(MemoryProvider):
         if not self._active or not self._auto_recall or not self._client or not query.strip():
             return ""
         # Profile and search run in parallel, each bounded by api_timeout; either one failing leaves the other.
-        jobs = {"search": lambda: self._client.search_memories(query, limit=self._max_recall_results, timeout=self._api_timeout)}
+        tag = self._speaker_tag(self._speaker)
+        jobs = {"search": lambda: self._client.search_memories(query, limit=self._max_recall_results, container_tag=tag, timeout=self._api_timeout)}
         if self._turn_count <= 1 or self._turn_count % self._profile_frequency == 0:
-            jobs["profile"] = lambda: self._client.get_profile(timeout=self._api_timeout)
+            jobs["profile"] = lambda: self._client.get_profile(container_tag=tag, timeout=self._api_timeout)
         found: Dict[str, Any] = {}
         threads = [spawn_context_thread(lambda k=k, fn=fn: found.__setitem__(k, _quietly(fn, "Supermemory recall (%s) failed", k)),
                                         name=f"supermemory-recall-{k}") for k, fn in jobs.items()]
@@ -588,6 +631,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
     # Turns 1.0.x already stored for this session stay in its documents; only the rest go to the 2.0 document.
     def _without_legacy_turns(self, turns: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        if self._container_tag != self._base_tag:
+            return turns
         key = (self._base_url, self._container_tag, self._doc_session)
         if self._legacy_text is None and key in _LEGACY_TEXT:
             self._legacy_text = _LEGACY_TEXT[key]
@@ -632,28 +677,45 @@ class SupermemoryMemoryProvider(MemoryProvider):
             digest = hashlib.sha256(content.encode()).hexdigest()
             if digest == self._captured_digest and self._unsent is None:
                 return
-            doc = {"content": content, "metadata": {"type": "conversation", "session_id": self._doc_session, "docId": self._doc_id}}
+            doc = {"content": content, "metadata": {"type": "conversation", "session_id": self._doc_session, "docId": self._doc_id, **self._ids()}}
             if self._write(self._doc_id, doc, mode):
                 self._captured_digest, self._unsent = digest, None
             else:
                 self._unsent = doc
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "",
-                  messages: Optional[list] = None) -> None:
+                  messages: Optional[list] = None, turn_author: Optional[dict] = None) -> None:
         # Host runs this on a worker thread, so the blocking write is fine here.
         if not self._can_write() or not self._auto_capture:
             return
         if session_id and session_id != self._session_id:
             self.on_session_switch(session_id)
+        if self._per_speaker:
+            author = str((turn_author or {}).get("id") or self._speaker or self._user_id)
+            content = _format_turn(_clean_text_for_capture(_message_text(user_content)), _clean_text_for_capture(_message_text(assistant_content)))
+            meta = {"type": "conversation", "session_id": self._doc_session, "docId": self._doc_id, **self._ids(author)}
+            self._append_turns([(self._speaker_tag(author), meta, content)] if content.startswith("[role: user]") else [])
+            return
         turn = {"user": _clean_text_for_capture(_message_text(user_content)),
                 "assistant": _clean_text_for_capture(_message_text(assistant_content))}
         if messages is None and turn["user"]:
             self._turns.append(turn)
         self._capture("turn", messages, completed_only=True)
 
+    # A failed append is retried before the next one, oldest first, within the same bound as other pending writes.
+    def _append_turns(self, new: list) -> None:
+        with self._capture_lock:
+            queue, self._unsent_appends = self._unsent_appends + new, []
+            for tag, meta, content in queue:
+                if not _quietly(lambda t=tag, m=meta, c=content: self._client.append_document(
+                        m["docId"], c, m, container_tag=t, entity_context=self._entity_context, dreaming=self._dreaming) or True,
+                        "Supermemory capture failed (turn, document %s in %s)", meta["docId"], tag, level=logging.WARNING, default=False):
+                    self._unsent_appends.append((tag, meta, content))
+            del self._unsent_appends[:-_MAX_PENDING_DOCS]
+
     def _flush(self, mode: str, messages: Optional[list] = None) -> None:
         if self._can_write() and self._auto_capture:
-            self._capture(mode, messages)
+            self._append_turns([]) if self._per_speaker else self._capture(mode, messages)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         self._flush("session_end", messages)
@@ -681,8 +743,9 @@ class SupermemoryMemoryProvider(MemoryProvider):
             self._write_thread.join(timeout=2.0)
         self._write_thread = spawn_context_thread(
             _quietly, daemon=False, name="supermemory-memory-write",
-            args=(lambda: self._client.add_memory(content.strip(), metadata={"target": target, "type": "explicit_memory"},
-                                                  entity_context=self._entity_context, dreaming=self._dreaming),
+            args=(lambda: self._client.add_memory(content.strip(), metadata={"target": target, "type": "explicit_memory", **self._ids(self._speaker)},
+                                                  entity_context=self._entity_context, container_tag=self._speaker_tag(self._speaker),
+                                                  dreaming=self._dreaming),
                   "Supermemory on_memory_write failed"))
         self._write_thread.start()
 
@@ -708,6 +771,9 @@ class SupermemoryMemoryProvider(MemoryProvider):
             raise _TagError(f"Container tag '{tag}' is not allowed. Allowed: {', '.join(self._allowed_containers)}")
         return tag
 
+    def _tool_target(self, tag: Optional[str]) -> str:
+        return tag or self._speaker_tag(self._speaker)
+
     def _tool_store(self, args: dict) -> dict | str:
         content = str(args.get("content") or "").strip()
         if not content:
@@ -716,8 +782,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
         metadata.setdefault("type", _detect_category(content))
         metadata.pop("source", None)
         tag = self._tool_container_tag(args)
-        result = self._client.add_memory(content, metadata=metadata, entity_context=self._entity_context, container_tag=tag,
-                                         dreaming=self._dreaming)
+        result = self._client.add_memory(content, metadata={**self._ids(self._speaker), **metadata}, entity_context=self._entity_context,
+                                         container_tag=self._tool_target(tag), dreaming=self._dreaming)
         return _tagged({"saved": True, "id": result.get("id", ""), "preview": content[:80] + ("..." if len(content) > 80 else "")}, tag)
 
     def _tool_search(self, args: dict) -> dict | str:
@@ -729,7 +795,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         results = [{"id": i.get("id", ""), "content": i.get("memory", ""),
                     **({"document_id": i["document_id"]} if i.get("document_id") else {}),
                     **({"similarity": pct} if (pct := _similarity_pct(i.get("similarity"))) is not None else {})}
-                   for i in self._client.search_memories(query, limit=limit, container_tag=tag)]
+                   for i in self._client.search_memories(query, limit=limit, container_tag=self._tool_target(tag))]
         return _tagged({"results": results, "count": len(results)}, tag)
 
     def _tool_forget(self, args: dict) -> dict | str:
@@ -738,19 +804,19 @@ class SupermemoryMemoryProvider(MemoryProvider):
             return tool_error("Provide either id or query")
         tag = self._tool_container_tag(args)  # not echoed in the response
         if not memory_id:
-            return self._client.forget_by_query(query, container_tag=tag)
-        if error := self._client.forget_memory(memory_id, container_tag=tag):
+            return self._client.forget_by_query(query, container_tag=self._tool_target(tag))
+        if error := self._client.forget_memory(memory_id, container_tag=self._tool_target(tag)):
             return tool_error(f"Forget failed: {error}")
         return {"forgotten": True, "id": memory_id}
 
     def _tool_profile(self, args: dict) -> dict:
         tag = self._tool_container_tag(args)
         query = str(args.get("query") or "").strip()
-        resp = {"profile": self._client.get_profile(container_tag=tag)}
+        resp = {"profile": self._client.get_profile(container_tag=self._tool_target(tag))}
         if query:
             resp["results"] = [{"id": i.get("id", ""), "content": i.get("memory", ""),
                                 **({"similarity": pct} if (pct := _similarity_pct(i.get("similarity"))) is not None else {})}
-                               for i in self._client.search_memories(query, limit=self._max_recall_results, container_tag=tag)]
+                               for i in self._client.search_memories(query, limit=self._max_recall_results, container_tag=self._tool_target(tag))]
         return _tagged(resp, tag)
 
     def _tool_read_document(self, args: dict) -> dict | str:
@@ -759,7 +825,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
             return tool_error("document_id is required")
         offset = _clamp_number(args.get("offset") or 0, 0, 0, 10**9, int)
         tag = self._tool_container_tag(args)
-        return _tagged(self._client.read_document(document_id, offset, container_tag=tag), tag)
+        return _tagged(self._client.read_document(document_id, offset, container_tag=self._tool_target(tag)), tag)
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         """Handlers return a tool_error() string for bad args or a dict to JSON-encode; client failures get ``fail_prefix``."""
