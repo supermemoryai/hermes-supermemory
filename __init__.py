@@ -581,9 +581,10 @@ class SupermemoryMemoryProvider(MemoryProvider):
         marker = Path(self._hermes_home) / ".supermemory_legacy_tags_warned"
         if not renamed or marker.exists():
             return
+        config_file = "supermemory/config.json" if (Path(self._hermes_home) / "supermemory" / "config.json").exists() else "supermemory.json"
         logger.warning("Memories saved by hermes-supermemory 1.0.1 are under the old tag (old -> new): %s. To keep them, set the old name "
-                       "in supermemory.json, or have an org admin merge it into the new tag from Namespaces at console.supermemory.ai "
-                       "after your first save.", ", ".join(f"{old} -> {new}" for old, new in renamed))
+                       "in %s, or have an org admin merge it into the new tag from Namespaces at console.supermemory.ai "
+                       "after your first save.", ", ".join(f"{old} -> {new}" for old, new in renamed), config_file)
         _quietly(marker.touch, "Failed to write %s", marker)
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
@@ -677,7 +678,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._captured_digest: Optional[str] = None
         self._unsent: Optional[dict] = None
         self._legacy_text: Optional[str] = None
-        self._authors: Dict[str, str] = {}
+        self._turn_authors: Dict[int, tuple] = {}
         self._speakers: Dict[str, dict] = {}
 
     def _write(self, doc_id: str, doc: dict, mode: str) -> bool:
@@ -759,10 +760,12 @@ class SupermemoryMemoryProvider(MemoryProvider):
             self.on_session_switch(session_id)
         turn = {"user": _clean_text_for_capture(_message_text(user_content)),
                 "assistant": _clean_text_for_capture(_message_text(assistant_content))}
-        if self._per_speaker and turn["user"]:
-            self._authors[turn["user"]] = str((turn_author or {}).get("id") or self._speaker or self._user_id)
         if messages is None and turn["user"]:
             self._turns.append(turn)
+        if self._per_speaker and self._can_write() and self._auto_capture:
+            author = str((turn_author or {}).get("id") or self._speaker or self._user_id)
+            self._capture_speakers("turn", messages, completed_only=True, author=(author, turn["user"]))
+            return
         self._flush("turn", messages, completed_only=True)
 
     # The stored turns of a speaker's document, [] when it does not exist yet, None when the read failed.
@@ -776,27 +779,35 @@ class SupermemoryMemoryProvider(MemoryProvider):
             return None
         return [{"user": u, "assistant": a} for u, a in _STORED_TURN_RE.findall(stored)]
 
-    # Each speaker's turns, picked from the transcript by author, replace that speaker's document, so a retry or rewind never stores one twice.
-    def _capture_speakers(self, mode: str, messages: Optional[list], *, completed_only: bool = False) -> None:
+    # Turns are attributed by their place in the transcript, and without a compaction the transcript is the whole truth, so stored turns it no longer holds were rewound.
+    def _capture_speakers(self, mode: str, messages: Optional[list], *, completed_only: bool = False, author: Optional[tuple] = None) -> None:
         with self._capture_lock:
             self._retry_pending(mode)
             turns = _turns_from_messages(messages) if messages is not None else self._turns
             if completed_only and turns and not turns[-1]["assistant"]:
                 turns = turns[:-1]
-            for author in dict.fromkeys(self._authors.values()):
-                tag = self._speaker_tag(author)
-                state = self._speakers.setdefault(tag, {"archive": None, "turns": [], "digest": None, "unsent": None})
-                state["turns"] = [t for t in turns if self._authors.get(t["user"]) == author] or state["turns"]
+            if author and author[1] and turns and turns[-1]["user"] == author[1]:
+                self._turn_authors[len(turns) - 1] = author
+            complete = messages is not None and not any(isinstance(m, dict) and m.get("_compressed_summary") for m in messages)
+            speakers = {self._speaker_tag(a): a for a, _ in self._turn_authors.values()}
+            speakers.update({tag: state["author"] for tag, state in self._speakers.items() if tag not in speakers})
+            for tag, speaker in speakers.items():
+                state = self._speakers.setdefault(tag, {"author": speaker, "archive": None, "turns": [], "digest": None, "unsent": None})
+                if messages is not None or author:
+                    state["turns"] = [turns[i] for i, (a, user) in sorted(self._turn_authors.items())
+                                      if a == speaker and i < len(turns) and turns[i]["user"] == user]
                 if state["archive"] is None:
                     state["archive"] = self._stored_turns(tag)
                 if state["archive"] is None:
                     continue
-                content = "\n\n".join(_format_turn(t["user"], t["assistant"]) for t in _join_turns(state["archive"], state["turns"]))
+                kept = [t for t in state["archive"] if not complete or t in turns]
+                state["content_turns"] = kept + [t for t in state["turns"] if t not in kept]
+                content = "\n\n".join(_format_turn(t["user"], t["assistant"]) for t in state["content_turns"])
                 digest = hashlib.sha256(content.encode()).hexdigest()
                 if not content or (digest == state["digest"] and state["unsent"] is None):
                     continue
                 doc = {"content": content, "container_tag": tag,
-                       "metadata": {"type": "conversation", "session_id": self._doc_session, "docId": self._doc_id, **self._ids(author)}}
+                       "metadata": {"type": "conversation", "session_id": self._doc_session, "docId": self._doc_id, **self._ids(speaker)}}
                 if self._write(self._doc_id, doc, mode):
                     state["digest"], state["unsent"] = digest, None
                 else:
@@ -818,9 +829,10 @@ class SupermemoryMemoryProvider(MemoryProvider):
             self._flush("session_switch")
             with self._capture_lock:
                 self._archive, self._turns = _join_turns(self._archive, self._turns), []
+                self._turn_authors = {}
                 for state in self._speakers.values():
                     if state["archive"] is not None:
-                        state["archive"], state["turns"] = _join_turns(state["archive"], state["turns"]), []
+                        state["archive"], state["turns"] = state.get("content_turns", state["archive"]), []
         elif (new_id and new_id != self._session_id) or reset:
             self._flush("session_switch")
             with self._capture_lock:

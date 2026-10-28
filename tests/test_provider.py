@@ -872,3 +872,37 @@ def test_first_run_keeps_a_chosen_scope_and_skips_fresh_installs(api, tmp_path):
     make_provider(tmp_path)
     assert json.loads((tmp_path / "supermemory" / "config.json").read_text()) == {"memory_scope": "user"}
 
+
+
+def test_group_speakers_with_the_same_text_keep_their_own_turns(api, tmp_path):
+    scope(tmp_path, "user")
+    provider = make_provider(tmp_path, **{**GATEWAY, "chat_type": "group"})
+    one = transcript(("yes", "Noted, Ann."))
+    group_turn(provider, "42", one)
+    two = one + transcript(("yes", "Noted, Bo."))
+    group_turn(provider, "7", two)
+    yes = lambda reply: f"[role: user]\nyes\n[user:end]\n[role: assistant]\n{reply}\n[assistant:end]"
+    assert api.captures() == {"hermes:telegram:user:42/hermes_session-1": yes("Noted, Ann."),
+                              "hermes:telegram:user:7/hermes_session-1": yes("Noted, Bo.")}
+
+
+def test_group_rewind_drops_stored_turns_the_transcript_no_longer_has(api, tmp_path):
+    scope(tmp_path, "user")
+    group = {**GATEWAY, "chat_type": "group"}
+    full = transcript(("Book the usual table", "Booked."), ("And a cab at 7.", "Cab booked."), ("Make it 8 instead.", "Moved to 8."))
+    first = make_provider(tmp_path, **group)
+    for n in (2, 4, 6):
+        group_turn(first, "42", full[:n * 2])
+    mine = "hermes:telegram:user:42/hermes_session-1"
+    assert api.captures()[mine] == "\n\n".join((TURN1, TURN2, TURN3))
+    rewound = transcript(("Book the usual table", "Booked."), ("Make it 9 instead.", "Moved to 9."))
+    group_turn(make_provider(tmp_path, **group), "42", rewound)
+    turn9 = "[role: user]\nMake it 9 instead.\n[user:end]\n[role: assistant]\nMoved to 9.\n[assistant:end]"
+    assert api.captures()[mine] == TURN1 + "\n\n" + turn9
+
+
+def test_legacy_tag_warning_names_the_file_that_wins(api, tmp_path, caplog):
+    (tmp_path / "supermemory.json").write_text(json.dumps({"container_tag": "hermes-{identity}"}))
+    make_provider(tmp_path, agent_identity="coder")
+    assert "set the old name in supermemory/config.json" in caplog.text
+
