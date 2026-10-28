@@ -131,6 +131,12 @@ _CONFIG_SPEC: Dict[str, tuple] = {
     "auto_capture": (True, lambda v: _as_bool(v, True)),
     "max_recall_results": (10, lambda v: _clamp_number(v, 10, 1, 20, int)),
     "threshold": (0.5, lambda v: _clamp_number(v, 0.5, 0.0, 1.0, float)),
+    "rerank": ("none", lambda v: v if (v := str(v or "").strip().lower()) in ("none", "order") else "none"),
+    "rewrite_query": (False, lambda v: _as_bool(v, False)),
+    "include_documents": (False, lambda v: _as_bool(v, False)),
+    "include_related": (False, lambda v: _as_bool(v, False)),
+    "include_forgotten": (False, lambda v: _as_bool(v, False)),
+    "allow_agent_search_overrides": (True, lambda v: _as_bool(v, True)),
     "profile_frequency": (50, lambda v: _clamp_number(v, 50, 1, 500, int)),
     "capture_mode": ("all", lambda v: "everything" if v == "everything" else "all"),
     "search_mode": ("hybrid", _search_mode),
@@ -218,7 +224,7 @@ def _result_fields(item: dict) -> dict:
     """A v5 search result (memory or document chunk) as the plain dict the formatters use."""
     metadata = item.get("metadata") or {}
     document = (item.get("included") or {}).get("document") or {}
-    return {"id": item.get("id") or "", "memory": item.get("memory") or item.get("chunk") or "",
+    return {"id": item.get("id") or "", "memory": item.get("memory") or item.get("chunk") or "", "related": (item.get("included") or {}).get("related"),
             "similarity": item.get("similarity"), "updated_at": item.get("updatedAt") or item.get("updated_at"),
             "document_id": metadata.get("docId") or document.get("id") or item.get("documentId") or "",
             "metadata": metadata}
@@ -295,12 +301,15 @@ class _SupermemoryClient:
                            for i in ids)
 
     def search_memories(self, query: str, *, limit: int = 5, container_tag: Optional[str] = None,
-                        search_mode: Optional[str] = None, threshold: Optional[float] = None,
-                        timeout: Optional[float] = None) -> list[dict]:
+                        search_mode: Optional[str] = None, threshold: Optional[float] = None, rerank: str = "",
+                        rewrite_query: bool = False, include: Optional[dict] = None, timeout: Optional[float] = None) -> list[dict]:
         mode = search_mode or self._search_mode
         response = self._client.search(container_tag or self._container_tag, query=query[:_MAX_QUERY_CHARS], limit=limit,
                                        **({"search_mode": mode} if mode in _VALID_SEARCH_MODES else {}),
                                        **({"threshold": threshold} if threshold is not None else {}),
+                                       **({"rerank": rerank} if rerank and rerank != "none" else {}),
+                                       **({"rewrite_query": True} if rewrite_query else {}),
+                                       **({"include": include} if include else {}),
                                        **({"timeout": timeout} if timeout else {}))
         return [_result_fields(item) for item in _as_dict(response).get("results") or []]
 
@@ -477,7 +486,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._base_url, self._allowed_containers = _DEFAULT_BASE_URL, []  # env var is only consulted in initialize()
 
     def _apply_config(self, config: dict) -> None:
-        for key in ("auto_recall", "auto_capture", "max_recall_results", "threshold", "profile_frequency", "capture_mode",
+        for key in ("auto_recall", "auto_capture", "max_recall_results", "threshold", "rerank", "rewrite_query", "include_documents",
+                    "include_related", "include_forgotten", "allow_agent_search_overrides", "profile_frequency", "capture_mode",
                     "search_mode", "entity_context", "dreaming", "api_timeout", "custom_container_instructions"):
             setattr(self, f"_{key}", config[key])
         self._custom_containers = [_sanitize_tag(t) for t in config["custom_containers"]]
@@ -610,6 +620,10 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._profile_jobs[tag] = job = spawn_context_thread(fetch, name="supermemory-profile")
         job.start()
 
+    def _search_options(self, rerank: str = "") -> Dict[str, Any]:
+        include = {k: True for k in ("documents", "related", "forgotten") if getattr(self, f"_include_{k}")}
+        return {"threshold": self._threshold, "rerank": rerank or self._rerank, "rewrite_query": self._rewrite_query, "include": include}
+
     # Only the search blocks the turn; the profile comes from the cache that queue_prefetch keeps fresh.
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         self._last_recall = None
@@ -620,7 +634,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         if due and tag not in self._profiles:
             self._refresh_profile(tag)
         found = _quietly(lambda: self._client.search_memories(query, limit=self._max_recall_results, container_tag=tag, search_mode="memories",
-                                                              threshold=self._threshold, timeout=self._api_timeout),
+                                                              timeout=self._api_timeout, **self._search_options()),
                          "Supermemory recall failed", default=[])
         hits = [hit for hit in found if hit.get("id") not in self._recalled_ids]
         profile = self._profiles.get(tag, "") if due else ""
@@ -801,6 +815,10 @@ class SupermemoryMemoryProvider(MemoryProvider):
         for schema in schemas if self._enable_custom_containers else ():  # multi-container mode: every tool takes container_tag
             schema["parameters"]["properties"]["container_tag"] = {
                 "type": "string", "description": f"Optional container tag. Allowed: {', '.join(self._allowed_containers)}. Defaults to primary ({self._container_tag})."}
+        if self._allow_agent_search_overrides:
+            search = next(s for s in schemas if s["name"] == "supermemory_search")["parameters"]["properties"]
+            search["search_mode"] = {"type": "string", "enum": list(_VALID_SEARCH_MODES), "description": f"Defaults to {self._search_mode}."}
+            search["aggregate"] = {"type": "boolean", "description": "Merge overlapping results into cleaner answers; slower."}
         return [{**s, "name": _KEBAB_ALIASES[s["name"]]} for s in schemas]
 
     def _tool_container_tag(self, args: dict) -> Optional[str]:
@@ -832,10 +850,15 @@ class SupermemoryMemoryProvider(MemoryProvider):
             return tool_error("query is required")
         limit = _clamp_number(args.get("limit", 5) or 5, 5, 1, 20, int)
         tag = self._tool_container_tag(args)
+        overrides = self._allow_agent_search_overrides
+        mode = _search_mode(args["search_mode"]) if overrides and args.get("search_mode") else None
+        rerank = "aggregate" if overrides and _as_bool(args.get("aggregate"), False) else ""
         results = [{"id": i.get("id", ""), "content": i.get("memory", ""),
                     **({"document_id": i["document_id"]} if i.get("document_id") else {}),
-                    **({"similarity": pct} if (pct := _similarity_pct(i.get("similarity"))) is not None else {})}
-                   for i in self._client.search_memories(query, limit=limit, container_tag=self._tool_target(tag))]
+                    **({"similarity": pct} if (pct := _similarity_pct(i.get("similarity"))) is not None else {}),
+                    **({"related": i["related"]} if i.get("related") else {})}
+                   for i in self._client.search_memories(query, limit=limit, container_tag=self._tool_target(tag), search_mode=mode,
+                                                         **self._search_options(rerank))]
         return _tagged({"results": results, "count": len(results)}, tag)
 
     def _tool_forget(self, args: dict) -> dict | str:
@@ -856,7 +879,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
         if query:
             resp["results"] = [{"id": i.get("id", ""), "content": i.get("memory", ""),
                                 **({"similarity": pct} if (pct := _similarity_pct(i.get("similarity"))) is not None else {})}
-                               for i in self._client.search_memories(query, limit=self._max_recall_results, container_tag=self._tool_target(tag))]
+                               for i in self._client.search_memories(query, limit=self._max_recall_results, container_tag=self._tool_target(tag),
+                                                                     **self._search_options())]
         return _tagged(resp, tag)
 
     def _tool_read_document(self, args: dict) -> dict | str:

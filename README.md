@@ -56,10 +56,14 @@ Config file: `$HERMES_HOME/supermemory.json`
 | `auto_recall` | `true` | Inject relevant memory context before turns |
 | `auto_capture` | `true` | Store cleaned user-assistant turns after each response |
 | `max_recall_results` | `10` | Max search results recalled with the profile (1-20) |
-| `threshold` | `0.5` | Minimum similarity (0-1) for a recalled memory. Automatic recall searches memories only; the search tool uses `search_mode` |
+| `threshold` | `0.5` | Minimum similarity (0-1) for automatic recall and the search tool. Automatic recall searches memories only |
 | `profile_frequency` | `50` | Include profile facts on the first turn, after a compaction, and every N turns |
 | `capture_mode` | `all` | Skip tiny or trivial turns by default |
-| `search_mode` | `hybrid` | Search mode: `hybrid`, `memories` (memories only), `chunks` (document excerpts only; `documents` is accepted as before) |
+| `search_mode` | `hybrid` | Default mode of the search tool: `hybrid`, `memories` (memories only), `chunks` (document excerpts only; `documents` is accepted as before) |
+| `rerank` | `none` | `order` re-ranks results. The search tool can also ask for `aggregate`, which merges overlapping results |
+| `rewrite_query` | `false` | Rewrite the query before searching (about 400 ms slower) |
+| `include_documents`, `include_related`, `include_forgotten` | `false` | Add each result's source document, related memories, or forgotten memories |
+| `allow_agent_search_overrides` | `true` | Let the search tool pick `search_mode` and `aggregate`; `false` always uses the config |
 | `entity_context` | built-in default | Extraction guidance passed to Supermemory |
 | `dreaming` | `dynamic` | `dynamic` groups related conversations before forming memories; `instant` processes each one right away (billed as one extra operation) |
 | `api_timeout` | `5.0` | Timeout for SDK requests |

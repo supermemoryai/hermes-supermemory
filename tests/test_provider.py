@@ -672,3 +672,27 @@ def test_recall_status_counts_the_last_prefetch(api, tmp_path):
     manager.providers[0].on_turn_start(2, "again")
     assert manager.prefetch_all("email again?", session_id="session-1") == ""
     assert manager.describe_recall() == ""
+
+
+def search_bodies(api):
+    return [r["body"] for r in api.requests if r["path"].endswith("/search")]
+
+
+def test_search_options_reach_the_api(api, tmp_path):
+    (tmp_path / "supermemory.json").write_text(json.dumps(
+        {"rerank": "order", "rewrite_query": True, "threshold": 0.7, "include_related": True}))
+    provider = make_provider(tmp_path)
+    provider.prefetch("email?")
+    provider.handle_tool_call("supermemory-search", {"query": "email", "search_mode": "chunks", "aggregate": True})
+    shared = {"threshold": 0.7, "rewriteQuery": True, "include": {"related": True}}
+    assert search_bodies(api) == [{"query": "email?", "limit": 10, "searchMode": "memories", "rerank": "order", **shared},
+                                  {"query": "email", "limit": 5, "searchMode": "chunks", "rerank": "aggregate", **shared}]
+
+
+def test_locked_search_options_are_hidden_and_ignored(api, tmp_path):
+    (tmp_path / "supermemory.json").write_text(json.dumps({"allow_agent_search_overrides": False}))
+    provider = make_provider(tmp_path)
+    search = next(s for s in provider.get_tool_schemas() if s["name"] == "supermemory-search")
+    assert set(search["parameters"]["properties"]) == {"query", "limit"}
+    provider.handle_tool_call("supermemory-search", {"query": "email", "search_mode": "chunks", "aggregate": True})
+    assert search_bodies(api) == [{"query": "email", "limit": 5, "searchMode": "hybrid", "threshold": 0.5}]
