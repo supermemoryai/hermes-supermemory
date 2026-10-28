@@ -32,7 +32,7 @@ class FakeAPI:
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content) if request.content else None
-        path = request.url.raw_path.decode().split("?", 1)[0]
+        path, self.query = request.url.raw_path.decode().split("?", 1)[0], dict(request.url.params)
         self.requests.append({"method": request.method, "path": path, "body": body,
                               "headers": {k.lower(): v for k, v in request.headers.items()}})
         for failure in list(self.failures):
@@ -46,18 +46,20 @@ class FakeAPI:
         return response
 
     def route(self, method, path, body):
+        namespace = path.split("/")[2]
+        key = lambda doc_id: doc_id if namespace == "hermes" else f"{namespace}/{doc_id}"
         if path.endswith("/profile"):
             return httpx.Response(200, text=PROFILE, headers={"content-type": "text/markdown"})
         if path.endswith("/search"):
             return httpx.Response(200, json={"results": self.results})
         if path.endswith("/document") and method == "POST":
-            doc_id = body.get("id") or f"auto-{len(self.requests)}"
+            doc_id = key(body.get("id") or f"auto-{len(self.requests)}")
             old = self.docs.get(doc_id, {}).get("content", "")
             content = body["content"] if not old or body["content"].startswith(old) else old + "\n\n" + body["content"]
             self.docs[doc_id] = {**self.docs.get(doc_id, {}), **body, "id": doc_id, "content": content}
             return httpx.Response(200, json={"id": doc_id, "status": "queued"})
         if "/document/" in path and method == "PATCH":
-            doc_id = unquote(path.rsplit("/", 1)[1])
+            doc_id = key(unquote(path.rsplit("/", 1)[1]))
             if doc_id not in self.docs:
                 return httpx.Response(404, json={"error": "Document not found"})
             self.docs[doc_id] = {**self.docs[doc_id], **body, "id": doc_id}
@@ -65,18 +67,20 @@ class FakeAPI:
         if path.endswith("/list/documents"):
             wanted = body.get("filter") or {}
             wanted = {p["field"]: p["value"] for p in wanted.get("operands") or [wanted]}
-            docs = [{"id": k, "type": "text", "metadata": v.get("metadata") or {}, "system": {"status": "done"},
+            docs = [{"id": k.rsplit("/", 1)[-1], "type": "text", "metadata": v.get("metadata") or {}, "system": {"status": "done"},
                      **({"content": v.get("content")} if (body.get("include") or {}).get("content") else {})}
-                    for k, v in self.docs.items() if wanted.items() <= (v.get("metadata") or {}).items()]
+                    for k, v in self.docs.items() if key(k.rsplit("/", 1)[-1]) == k and wanted.items() <= (v.get("metadata") or {}).items()]
+            page, size = int(self.query.get("page", 1)), int(self.query.get("limit", 100))
+            pages, docs = max(1, -(-len(docs) // size)), docs[(page - 1) * size:page * size]
             return httpx.Response(200, json={"documents": docs, "chunks": [], "memories": [],
-                                             "pagination": {"currentPage": 1, "totalItems": len(docs), "totalPages": 1, "limit": 100}})
+                                             "pagination": {"currentPage": page, "totalItems": len(docs), "totalPages": pages, "limit": size}})
         if "/document/" in path:
-            doc_id = unquote(path.rsplit("/", 1)[1])
+            doc_id = key(unquote(path.rsplit("/", 1)[1]))
             if doc_id not in self.docs:
                 return httpx.Response(404, json={"error": "Document not found"})
             return httpx.Response(200, json={"type": "text", "metadata": {}, "system": {"status": "done"}, **self.docs[doc_id]})
         if method == "DELETE" and path.endswith("/document"):
-            gone = [i for i in body["ids"] if self.docs.pop(i, None)]
+            gone = [i for i in body["ids"] if self.docs.pop(key(i), None)]
             return httpx.Response(200, json={"count": len(gone), "errors": []})
         if method == "DELETE" and path.endswith("/memories"):
             ids = body.get("ids") or []
@@ -305,7 +309,8 @@ def test_builtin_memory_writes_are_mirrored(api, tmp_path):
     provider.shutdown()
     bodies = [w["body"] for w in api.writes()]
     assert bodies[0] == {"content": "likes tea", "date": bodies[0]["date"], "supportingContext": sm._DEFAULT_ENTITY_CONTEXT,
-                         "dreaming": "dynamic", "metadata": {"sm_source": "hermes", "target": "user", "type": "explicit_memory"}}
+                         "dreaming": "dynamic", "id": sm._mirror_doc_id("user", "likes tea"),
+                         "metadata": {"sm_source": "hermes", "target": "user", "type": "explicit_memory"}}
     provider.on_memory_write("replace", "user", "likes coffee", metadata={"previous_content": "likes tea"})
     provider.shutdown()
     mirrored = lambda: sorted((d["metadata"]["target"], d["content"]) for d in api.docs.values())
@@ -313,6 +318,25 @@ def test_builtin_memory_writes_are_mirrored(api, tmp_path):
     provider.on_memory_write("remove", "user", "", metadata={"previous_content": "likes coffee"})
     provider.shutdown()
     assert mirrored() == [("memory", "likes tea")]
+
+
+def test_mirrors_without_a_stable_id_are_found_on_any_page(api, tmp_path):
+    for n in range(150):
+        api.docs[f"old-{n}"] = {"content": f"fact {n}", "metadata": {"type": "explicit_memory", "target": "user"}}
+    provider = make_provider(tmp_path)
+    provider.on_memory_write("remove", "user", "", metadata={"previous_content": "fact 140"})
+    provider.shutdown()
+    assert "old-140" not in api.docs and len(api.docs) == 149
+
+
+def test_failed_mirror_delete_is_retried(api, tmp_path):
+    provider = make_provider(tmp_path)
+    provider.on_memory_write("add", "user", "likes tea")
+    provider.shutdown()
+    api.failures = [("/document", 503)]
+    provider.on_memory_write("remove", "user", "", metadata={"previous_content": "likes tea"})
+    provider.shutdown()
+    assert api.docs == {}
 
 
 def test_custom_containers_are_namespaces(api, tmp_path):
@@ -614,9 +638,34 @@ def test_group_chat_files_each_speaker_under_that_speaker(api, tmp_path):
     provider.on_session_end([])
     searches = [r["path"] for r in api.requests if r["path"].endswith("/search")]
     assert searches == ["/ns/hermes:telegram:user:42/search", "/ns/hermes:telegram:user:7/search"]
-    writes = [(w["path"], w["body"]["id"], w["body"]["content"], w["body"]["metadata"]["user_id"]) for w in api.writes()]
-    assert writes == [("/ns/hermes:telegram:user:42/document", "hermes_session-1", TURN1, "42"),
-                      ("/ns/hermes:telegram:user:7/document", "hermes_session-1", TURN2, "7")]
+    assert api.captures() == {"hermes:telegram:user:42/hermes_session-1": TURN1, "hermes:telegram:user:7/hermes_session-1": TURN2}
+    assert {d["metadata"]["user_id"] for d in api.docs.values()} == {"42", "7"}
+
+
+def group_turn(provider, author, messages):
+    user, reply = sm._turns_from_messages(messages)[-1].values()
+    provider.on_turn_start(1, user, author_id=author)
+    provider.sync_turn(user, reply, messages=messages, turn_author={"id": author, "name": None, "is_bot": False})
+
+
+def test_group_capture_survives_lost_responses_rewinds_and_new_providers(api, tmp_path):
+    scope(tmp_path, "user")
+    group = {**GATEWAY, "chat_type": "group"}
+    provider = make_provider(tmp_path, **group)
+    one = transcript(("Book the usual table", "Booked."))
+    group_turn(provider, "42", one)
+    two = one + transcript(("And a cab at 7.", "Cab booked."))
+    api.lose = [True]
+    group_turn(provider, "42", two)
+    three = two + transcript(("Make it 8 instead.", "Moved to 8."))
+    group_turn(provider, "42", three)
+    mine = "hermes:telegram:user:42/hermes_session-1"
+    assert api.captures()[mine] == "\n\n".join((TURN1, TURN2, TURN3))
+    group_turn(provider, "42", two)
+    assert api.captures()[mine] == TURN1 + "\n\n" + TURN2
+    fresh = make_provider(tmp_path, **group)
+    group_turn(fresh, "42", two + transcript(("Make it 8 instead.", "Moved to 8.")))
+    assert api.captures()[mine] == "\n\n".join((TURN1, TURN2, TURN3))
 
 
 def test_identity_signature_follows_the_scope(tmp_path, monkeypatch):
@@ -749,6 +798,14 @@ def test_both_config_files_are_read(tmp_path, legacy, panel, expected):
         (tmp_path / "supermemory" / "config.json").write_text(json.dumps(panel))
     config = sm._load_supermemory_config(str(tmp_path))
     assert (config["container_tag"], config["auto_capture"]) == expected
+
+
+def test_setup_after_the_panel_takes_effect(tmp_path):
+    (tmp_path / "supermemory").mkdir()
+    (tmp_path / "supermemory" / "config.json").write_text(json.dumps({"memory_scope": "user"}))
+    SupermemoryMemoryProvider().save_config({"memory_scope": "chat"}, str(tmp_path))
+    assert sm._load_supermemory_config(str(tmp_path))["memory_scope"] == "chat"
+    assert json.loads((tmp_path / "supermemory" / "config.json").read_text()) == {"memory_scope": "chat"}
 
 
 def test_panel_schema_loads_and_saves_through_the_hermes_dashboard(tmp_path, monkeypatch):

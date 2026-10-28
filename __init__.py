@@ -163,9 +163,11 @@ def _load_supermemory_config(hermes_home: Optional[str] = None) -> dict:
     return config
 
 
+# Once the config panel's file exists it wins, so setup writes there too or its choice would be shadowed.
 def _save_supermemory_config(values: dict, hermes_home: str) -> None:
     from utils import atomic_json_write
-    config_path = Path(hermes_home) / "supermemory.json"
+    panel_path = Path(hermes_home) / "supermemory" / "config.json"
+    config_path = panel_path if panel_path.exists() else Path(hermes_home) / "supermemory.json"
     atomic_json_write(config_path, {**_read_json_dict(config_path), **values}, mode=0o600, sort_keys=True)
 
 
@@ -264,31 +266,26 @@ class _SupermemoryClient:
         return merged
 
     def add_memory(self, content: str, metadata: Optional[dict] = None, *, entity_context: str = "",
-                   container_tag: Optional[str] = None, dreaming: str = "") -> dict:
+                   container_tag: Optional[str] = None, dreaming: str = "", doc_id: str = "") -> dict:
         kwargs: dict[str, Any] = {"content": content.strip(), "date": datetime.now().astimezone().isoformat(timespec="seconds"),
+                                  **({"id": doc_id} if doc_id else {}),
                                   **({"metadata": self._merge_metadata(metadata)} if metadata else {}),
                                   **({"supporting_context": _clamp_entity_context(entity_context)} if entity_context else {}),
                                   **({"dreaming": dreaming} if dreaming else {})}
         return {"id": _as_dict(self._client.add(container_tag or self._container_tag, **kwargs)).get("id") or ""}
 
     # PATCH replaces the whole document, so a resend, rewind or edit never appends it to itself; the first write creates it.
-    def write_document(self, doc_id: str, content: str, metadata: dict, *, entity_context: str = "", dreaming: str = "") -> None:
+    def write_document(self, doc_id: str, content: str, metadata: dict, *, entity_context: str = "", dreaming: str = "",
+                       container_tag: Optional[str] = None) -> None:
+        tag = container_tag or self._container_tag
         kwargs: dict[str, Any] = {"content": content.strip(), "date": datetime.now().astimezone().isoformat(timespec="seconds"),
                                   "metadata": self._merge_metadata(metadata),
                                   **({"supporting_context": _clamp_entity_context(entity_context)} if entity_context else {}),
                                   **({"dreaming": dreaming} if dreaming else {})}
         try:
-            self._client.documents.update(self._container_tag, urllib.parse.quote(doc_id, safe=""), **kwargs)
+            self._client.documents.update(tag, urllib.parse.quote(doc_id, safe=""), **kwargs)
         except self._sm.NotFoundError:
-            self._client.add(self._container_tag, id=doc_id, **kwargs)
-
-    # POST to an existing id appends, so each speaker's document grows one turn at a time without a read.
-    def append_document(self, doc_id: str, content: str, metadata: dict, *, container_tag: str, entity_context: str = "",
-                        dreaming: str = "") -> None:
-        self._client.add(container_tag, id=doc_id, content=content.strip(), date=datetime.now().astimezone().isoformat(timespec="seconds"),
-                         metadata=self._merge_metadata(metadata),
-                         **({"supporting_context": _clamp_entity_context(entity_context)} if entity_context else {}),
-                         **({"dreaming": dreaming} if dreaming else {}))
+            self._client.add(tag, id=doc_id, **kwargs)
 
     # 1.0.x wrote a session as appended deltas in one document per 4-hour window, stamped with its session_id and no docId.
     def legacy_capture_text(self, session_id: str) -> str:
@@ -299,11 +296,17 @@ class _SupermemoryClient:
         return "\n\n".join(_as_dict(self._client.documents.get(self._container_tag, urllib.parse.quote(i, safe=""))).get("content") or ""
                            for i in ids)
 
-    def forget_mirrored(self, target: str, content: str, *, container_tag: str) -> None:
-        listed = _as_dict(self._client.list(container_tag, "documents", limit=100, include={"content": True}, filter={
-            "operator": "and", "operands": [{"field": "type", "operator": "eq", "value": "explicit_memory"},
-                                            {"field": "target", "operator": "eq", "value": target}]}))
-        ids = [d["id"] for d in listed.get("documents") or [] if (d.get("content") or "").strip() == content]
+    # Mirrors written before stable ids existed are found by their published text, across every page.
+    def forget_mirrored(self, target: str, content: str, container_tag: str) -> None:
+        if _as_dict(self._client.documents.delete(container_tag, ids=[_mirror_doc_id(target, content)])).get("count"):
+            return
+        ids, page, pages = [], 1, 1
+        while page <= pages:
+            listed = _as_dict(self._client.list(container_tag, "documents", page=page, limit=100, include={"content": True}, filter={
+                "operator": "and", "operands": [{"field": "type", "operator": "eq", "value": "explicit_memory"},
+                                                {"field": "target", "operator": "eq", "value": target}]}))
+            ids += [d["id"] for d in listed.get("documents") or [] if (d.get("content") or "").strip() == content]
+            page, pages = page + 1, int((listed.get("pagination") or {}).get("totalPages") or 1)
         if ids:
             self._client.documents.delete(container_tag, ids=ids)
 
@@ -363,6 +366,10 @@ class _SupermemoryClient:
 def _format_turn(user: str, assistant: str) -> str:
     """Render one turn in the [role: x]...[x:end] layout the entity context describes."""
     return "\n".join(f"[role: {role}]\n{text}\n[{role}:end]" for role, text in (("user", user), ("assistant", assistant)) if text)
+
+
+def _mirror_doc_id(target: str, content: str) -> str:
+    return "hermes_memory_" + hashlib.sha256(f"{target}:{content}".encode()).hexdigest()[:32]
 
 
 def _capture_doc_id(session_id: str) -> str:
@@ -479,7 +486,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._client: Optional[_SupermemoryClient] = None
         self._container_tag, self._write_enabled, self._active = _DEFAULT_CONTAINER_TAG, True, False
         self._base_tag, self._platform, self._user_id, self._chat_id, self._speaker = _DEFAULT_CONTAINER_TAG, "", "", "", ""
-        self._per_speaker, self._unsent_appends, self._recalled_ids = False, [], set()
+        self._per_speaker, self._pending_forgets, self._recalled_ids = False, [], set()
         self._profiles: Dict[str, str] = {}
         self._profile_jobs: Dict[str, threading.Thread] = {}
         self._profile_shown: set = set()
@@ -537,7 +544,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         raw_tag = _expand_container_tag(config["container_tag"], kwargs.get("agent_identity", "default"))
         self._base_tag = _sanitize_tag(raw_tag)
         self._platform, self._user_id, self._chat_id = (str(kwargs.get(k) or "").strip() for k in ("platform", "user_id", "chat_id"))
-        self._speaker, self._unsent_appends, self._recalled_ids = "", [], set()
+        self._speaker, self._pending_forgets, self._recalled_ids = "", [], set()
         self._container_tag = _scoped_tag(self._base_tag, config["memory_scope"], self._platform, self._user_id, self._chat_id)
         self._per_speaker = config["memory_scope"] == "user" and bool(self._user_id) and str(kwargs.get("chat_type") or "dm") != "dm"
         self._apply_config(config)
@@ -651,22 +658,27 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._captured_digest: Optional[str] = None
         self._unsent: Optional[dict] = None
         self._legacy_text: Optional[str] = None
+        self._authors: Dict[str, str] = {}
+        self._speakers: Dict[str, dict] = {}
 
     def _write(self, doc_id: str, doc: dict, mode: str) -> bool:
         return _quietly(lambda: self._client.write_document(doc_id, doc["content"], doc["metadata"], entity_context=self._entity_context,
-                                                            dreaming=self._dreaming) or True,
+                                                            dreaming=self._dreaming, container_tag=doc.get("container_tag")) or True,
                         "Supermemory capture failed (%s, document %s)", mode, doc_id, level=logging.WARNING, default=False)
 
     # Documents of earlier sessions whose last write failed.
     def _retry_pending(self, mode: str) -> None:
-        for doc_id, doc in list(self._pending.items()):
-            if self._write(doc_id, doc, mode):
-                self._pending.pop(doc_id, None)
+        for key, doc in list(self._pending.items()):
+            if self._write(doc.get("doc_id", key), doc, mode):
+                self._pending.pop(key, None)
 
     # A down service must not grow the retry buffer without bound; the oldest documents go first.
     def _park_unsent(self) -> None:
         if self._unsent:
             self._pending[self._doc_id] = self._unsent
+        for tag, state in self._speakers.items():
+            if state["unsent"]:
+                self._pending[f"{tag}/{self._doc_id}"] = {**state["unsent"], "doc_id": self._doc_id, "container_tag": tag}
         while len(self._pending) > _MAX_PENDING_DOCS or sum(len(d["content"]) for d in self._pending.values()) > _MAX_PENDING_BYTES:
             dropped = next(iter(self._pending))
             self._pending.pop(dropped)
@@ -726,32 +738,55 @@ class SupermemoryMemoryProvider(MemoryProvider):
             return
         if session_id and session_id != self._session_id:
             self.on_session_switch(session_id)
-        if self._per_speaker:
-            author = str((turn_author or {}).get("id") or self._speaker or self._user_id)
-            content = _format_turn(_clean_text_for_capture(_message_text(user_content)), _clean_text_for_capture(_message_text(assistant_content)))
-            meta = {"type": "conversation", "session_id": self._doc_session, "docId": self._doc_id, **self._ids(author)}
-            self._append_turns([(self._speaker_tag(author), meta, content)] if content.startswith("[role: user]") else [])
-            return
         turn = {"user": _clean_text_for_capture(_message_text(user_content)),
                 "assistant": _clean_text_for_capture(_message_text(assistant_content))}
+        if self._per_speaker and turn["user"]:
+            self._authors[turn["user"]] = str((turn_author or {}).get("id") or self._speaker or self._user_id)
         if messages is None and turn["user"]:
             self._turns.append(turn)
-        self._capture("turn", messages, completed_only=True)
+        self._flush("turn", messages, completed_only=True)
 
-    # A failed append is retried before the next one, oldest first, within the same bound as other pending writes.
-    def _append_turns(self, new: list) -> None:
+    # The stored turns of a speaker's document, [] when it does not exist yet, None when the read failed.
+    def _stored_turns(self, tag: str) -> Optional[List[Dict[str, str]]]:
+        try:
+            stored = self._client.read_document(self._doc_id, 0, container_tag=tag, limit=None)["content"]
+        except self._client._sm.NotFoundError:
+            return []
+        except Exception:
+            logger.warning("Supermemory: could not read %s in %s; its next write waits", self._doc_id, tag, exc_info=True)
+            return None
+        return [{"user": u, "assistant": a} for u, a in _STORED_TURN_RE.findall(stored)]
+
+    # Each speaker's turns, picked from the transcript by author, replace that speaker's document, so a retry or rewind never stores one twice.
+    def _capture_speakers(self, mode: str, messages: Optional[list], *, completed_only: bool = False) -> None:
         with self._capture_lock:
-            queue, self._unsent_appends = self._unsent_appends + new, []
-            for tag, meta, content in queue:
-                if not _quietly(lambda t=tag, m=meta, c=content: self._client.append_document(
-                        m["docId"], c, m, container_tag=t, entity_context=self._entity_context, dreaming=self._dreaming) or True,
-                        "Supermemory capture failed (turn, document %s in %s)", meta["docId"], tag, level=logging.WARNING, default=False):
-                    self._unsent_appends.append((tag, meta, content))
-            del self._unsent_appends[:-_MAX_PENDING_DOCS]
+            self._retry_pending(mode)
+            turns = _turns_from_messages(messages) if messages is not None else self._turns
+            if completed_only and turns and not turns[-1]["assistant"]:
+                turns = turns[:-1]
+            for author in dict.fromkeys(self._authors.values()):
+                tag = self._speaker_tag(author)
+                state = self._speakers.setdefault(tag, {"archive": None, "turns": [], "digest": None, "unsent": None})
+                state["turns"] = [t for t in turns if self._authors.get(t["user"]) == author] or state["turns"]
+                if state["archive"] is None:
+                    state["archive"] = self._stored_turns(tag)
+                if state["archive"] is None:
+                    continue
+                content = "\n\n".join(_format_turn(t["user"], t["assistant"]) for t in _join_turns(state["archive"], state["turns"]))
+                digest = hashlib.sha256(content.encode()).hexdigest()
+                if not content or (digest == state["digest"] and state["unsent"] is None):
+                    continue
+                doc = {"content": content, "container_tag": tag,
+                       "metadata": {"type": "conversation", "session_id": self._doc_session, "docId": self._doc_id, **self._ids(author)}}
+                if self._write(self._doc_id, doc, mode):
+                    state["digest"], state["unsent"] = digest, None
+                else:
+                    state["unsent"] = doc
 
     def _flush(self, mode: str, messages: Optional[list] = None, *, completed_only: bool = False) -> None:
         if self._can_write() and self._auto_capture:
-            self._append_turns([]) if self._per_speaker else self._capture(mode, messages, completed_only=completed_only)
+            capture = self._capture_speakers if self._per_speaker else self._capture
+            capture(mode, messages, completed_only=completed_only)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         self._flush("session_end", messages, completed_only=True)
@@ -764,6 +799,9 @@ class SupermemoryMemoryProvider(MemoryProvider):
             self._flush("session_switch")
             with self._capture_lock:
                 self._archive, self._turns = _join_turns(self._archive, self._turns), []
+                for state in self._speakers.values():
+                    if state["archive"] is not None:
+                        state["archive"], state["turns"] = _join_turns(state["archive"], state["turns"]), []
         elif (new_id and new_id != self._session_id) or reset:
             self._flush("session_switch")
             with self._capture_lock:
@@ -773,24 +811,34 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 self._turn_count = 0
         self._session_id = new_id or self._session_id
 
-    # A replace or remove drops the mirrored copy of the entry it changed, matched by its exact text.
+    # A replace or remove deletes the mirrored copy of the entry it changed; a failed delete is retried with the next mirror write.
     def on_memory_write(self, action: str, target: str, content: str, metadata: Optional[dict] = None) -> None:
         content, previous = (content or "").strip(), str((metadata or {}).get("previous_content") or "").strip()
         tag, speaker = self._speaker_tag(self._speaker), self._speaker
-        jobs = ([lambda: self._client.forget_mirrored(target, previous, container_tag=tag)] if action in {"replace", "patch", "remove"} and previous else [])
-        jobs += ([lambda: self._client.add_memory(content, metadata={"target": target, "type": "explicit_memory", **self._ids(speaker)},
-                                                  entity_context=self._entity_context, container_tag=tag, dreaming=self._dreaming)]
-                 if action in {"add", "replace", "patch"} and content else [])
-        if not self._can_write() or not jobs:
-            return
+        forgets = [(target, previous, tag)] if action in {"replace", "patch", "remove"} and previous else []
+        add = (lambda: self._client.add_memory(content, metadata={"target": target, "type": "explicit_memory", **self._ids(speaker)},
+                                               entity_context=self._entity_context, container_tag=tag, dreaming=self._dreaming,
+                                               doc_id=_mirror_doc_id(target, content))) if action in {"add", "replace", "patch"} and content else None
+        if self._can_write() and (forgets or add):
+            self._mirror(forgets, add)
+
+    def _mirror(self, forgets: list, add: Optional[Callable[[], Any]]) -> None:
+        def run() -> None:
+            queue, self._pending_forgets = self._pending_forgets + forgets, []
+            for forget in queue:
+                if not _quietly(lambda f=forget: self._client.forget_mirrored(*f) or True, "Supermemory mirrored delete failed", default=False):
+                    self._pending_forgets.append(forget)
+            del self._pending_forgets[:-_MAX_PENDING_DOCS]
+            _quietly(add or (lambda: None), "Supermemory on_memory_write failed")
         if self._write_thread and self._write_thread.is_alive():
             self._write_thread.join(timeout=2.0)
-        self._write_thread = spawn_context_thread(
-            lambda: [_quietly(job, "Supermemory on_memory_write (%s) failed", action) for job in jobs], daemon=False, name="supermemory-memory-write")
+        self._write_thread = spawn_context_thread(run, daemon=False, name="supermemory-memory-write")
         self._write_thread.start()
 
     def shutdown(self) -> None:
         self._flush("shutdown")
+        if self._pending_forgets and self._can_write():
+            self._mirror([], None)
         if self._write_thread and self._write_thread.is_alive():
             self._write_thread.join(timeout=5.0)
         self._write_thread = None
