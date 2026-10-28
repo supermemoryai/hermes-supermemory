@@ -46,7 +46,7 @@ the endpoint first ensures the setup connection probe also stays local.
 
 ## Config
 
-Config files: `$HERMES_HOME/supermemory.json`, and `$HERMES_HOME/supermemory/config.json`, which the config panel in the Hermes dashboard and Desktop writes. A value set in the panel wins, and once that file exists `hermes memory setup` writes there too.
+Config files: `$HERMES_HOME/supermemory.json`, and `$HERMES_HOME/supermemory/config.json`, which the config panel in the Hermes dashboard and Desktop writes. A value set in the panel wins, and once that file exists `hermes memory setup` writes there too. On the first run an existing `supermemory.json` is copied there, so after that, edit settings in the panel or in `supermemory/config.json`.
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -56,7 +56,7 @@ Config files: `$HERMES_HOME/supermemory.json`, and `$HERMES_HOME/supermemory/con
 | `auto_recall` | `true` | Inject relevant memory context before turns |
 | `auto_capture` | `true` | Store cleaned user-assistant turns after each response |
 | `max_recall_results` | `10` | Max search results recalled with the profile (1-20) |
-| `threshold` | `0.5` | Minimum similarity (0-1) for automatic recall and the search tool. Automatic recall searches memories only |
+| `threshold` | unset | Minimum similarity (0-1). Automatic recall uses 0.5 when unset and searches memories only; the search tool uses the server default unless this is set |
 | `profile_frequency` | `50` | Include profile facts on the first turn, after a compaction, and every N turns |
 | `search_mode` | `hybrid` | Default mode of the search tool: `hybrid`, `memories` (memories only), `chunks` (document excerpts only; `documents` is accepted as before) |
 | `rerank` | `none` | `order` re-ranks results. The search tool can also ask for `aggregate`, which merges overlapping results |
@@ -69,7 +69,7 @@ Config files: `$HERMES_HOME/supermemory.json`, and `$HERMES_HOME/supermemory/con
 
 ### Gateway memory scope
 
-Existing bots keep `shared`, so every user shares one container. To switch, set `"memory_scope": "user"` in `supermemory.json`; memories saved while shared stay in the old container.
+Existing bots keep `shared`, so every user shares one container. To switch, choose "Per user" in the panel or set `"memory_scope": "user"` in `supermemory/config.json`; memories saved while shared stay in the old container.
 
 ### Upgrading from 1.0.1
 

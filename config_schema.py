@@ -63,7 +63,7 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             group="Search",
         ),
         ProviderField(key="threshold", label="Minimum similarity", kind=KIND_NUMBER, placeholder="0.5",
-                      description="0 to 1. Higher returns fewer, closer matches.", group="Search"),
+                      description="0 to 1. Blank: 0.5 for automatic recall, the server default for the search tool.", group="Search"),
         ProviderField(
             key="rerank",
             label="Rerank",

@@ -39,6 +39,9 @@ _DATA_URI_RE = re.compile(r"data:[^;,\s]+;base64,[A-Za-z0-9+/=]+")  # pasted inl
 _READ_WINDOW_CHARS = 8000
 _MAX_QUERY_CHARS = 2000
 _MAX_CACHED_PROFILES = 64
+_RECALL_THRESHOLD = 0.5
+_PANEL_KEYS = ("container_tag", "memory_scope", "auto_recall", "auto_capture", "max_recall_results", "search_mode", "threshold",
+               "rerank", "rewrite_query", "include_documents", "include_related", "include_forgotten", "allow_agent_search_overrides")
 _MAX_PENDING_DOCS = 50
 _MAX_PENDING_BYTES = 256 * 1024
 _SUMMARY_END = "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
@@ -129,7 +132,7 @@ _CONFIG_SPEC: Dict[str, tuple] = {
     "auto_recall": (True, lambda v: _as_bool(v, True)),
     "auto_capture": (True, lambda v: _as_bool(v, True)),
     "max_recall_results": (10, lambda v: _clamp_number(v, 10, 1, 20, int)),
-    "threshold": (0.5, lambda v: _clamp_number(v, 0.5, 0.0, 1.0, float)),
+    "threshold": (None, lambda v: None if v is None else _clamp_number(v, None, 0.0, 1.0, float)),
     "rerank": ("none", lambda v: v if (v := str(v or "").strip().lower()) in ("none", "order") else "none"),
     "rewrite_query": (False, lambda v: _as_bool(v, False)),
     "include_documents": (False, lambda v: _as_bool(v, False)),
@@ -161,6 +164,18 @@ def _load_supermemory_config(hermes_home: Optional[str] = None) -> dict:
     for key, (_, normalize) in _CONFIG_SPEC.items():
         config[key] = normalize(config[key])
     return config
+
+
+# The panel reads only its own file, so an existing supermemory.json is copied there once and the panel shows real values.
+def _seed_panel_config(hermes_home: str) -> None:
+    from utils import atomic_json_write
+    legacy_path, panel_path = Path(hermes_home) / "supermemory.json", Path(hermes_home) / "supermemory" / "config.json"
+    if panel_path.exists() or not legacy_path.exists():
+        return
+    legacy = _read_json_dict(legacy_path)
+    panel_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json_write(panel_path, {"memory_scope": "shared", **{k: legacy[k] for k in _PANEL_KEYS if legacy.get(k) is not None}},
+                      mode=0o600, sort_keys=True)
 
 
 # Once the config panel's file exists it wins, so setup writes there too or its choice would be shadowed.
@@ -539,6 +554,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._hermes_home = kwargs.get("hermes_home") or str(get_hermes_home())
         self._session_id, self._turn_count, self._pending = session_id, 0, {}
         self._reset_capture(session_id)
+        _quietly(lambda: _seed_panel_config(self._hermes_home), "Failed to copy supermemory.json into the config panel's file", level=logging.WARNING)
         config = _load_supermemory_config(self._hermes_home)
         self._api_key = get_secret("SUPERMEMORY_API_KEY", "") or ""
         raw_tag = _expand_container_tag(config["container_tag"], kwargs.get("agent_identity", "default"))
@@ -620,6 +636,9 @@ class SupermemoryMemoryProvider(MemoryProvider):
         include = {k: True for k in ("documents", "related", "forgotten") if getattr(self, f"_include_{k}")}
         return {"threshold": self._threshold, "rerank": rerank or self._rerank, "rewrite_query": self._rewrite_query, "include": include}
 
+    def _recall_options(self) -> Dict[str, Any]:
+        return {**self._search_options(), "threshold": _RECALL_THRESHOLD if self._threshold is None else self._threshold}
+
     # Only the search blocks the turn; the profile comes from the cache that queue_prefetch keeps fresh.
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         self._last_recall = None
@@ -630,7 +649,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         if due and tag not in self._profiles:
             self._refresh_profile(tag)
         found = _quietly(lambda: self._client.search_memories(query, limit=self._max_recall_results, container_tag=tag, search_mode="memories",
-                                                              timeout=self._api_timeout, **self._search_options()),
+                                                              timeout=self._api_timeout, **self._recall_options()),
                          "Supermemory recall failed", default=[])
         hits = [hit for hit in found if hit.get("id") not in self._recalled_ids]
         profile = self._profiles.get(tag, "") if due else ""

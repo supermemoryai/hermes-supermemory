@@ -758,7 +758,7 @@ def test_locked_search_options_are_hidden_and_ignored(api, tmp_path):
     search = next(s for s in provider.get_tool_schemas() if s["name"] == "supermemory-search")
     assert set(search["parameters"]["properties"]) == {"query", "limit"}
     provider.handle_tool_call("supermemory-search", {"query": "email", "search_mode": "chunks", "aggregate": True})
-    assert search_bodies(api) == [{"query": "email", "limit": 5, "searchMode": "hybrid", "threshold": 0.5}]
+    assert search_bodies(api) == [{"query": "email", "limit": 5, "searchMode": "hybrid"}]
 
 
 def test_recall_dates_come_from_system_updated_at(api, tmp_path):
@@ -827,9 +827,48 @@ def test_panel_schema_loads_and_saves_through_the_hermes_dashboard(tmp_path, mon
     monkeypatch.setattr(memory_providers, "save_config", lambda config: None)
     memory_providers._update_memory_provider_config(schema, {f["key"]: f["value"] for f in payload["fields"]})
     config = sm._load_supermemory_config(str(tmp_path))
-    assert (config["memory_scope"], config["container_tag"], config["threshold"]) == ("user", "hermes", 0.5)
+    assert (config["memory_scope"], config["container_tag"], config["threshold"]) == ("user", "hermes", None)
+    panel_keys = {f.key for f in schema.fields} - {"api_key"}
+    assert panel_keys == set(sm._PANEL_KEYS)
 
 
 def test_compat_block_is_gone():
     assert not any(hasattr(sm, name) for name in ("STORE_SCHEMA", "SEARCH_SCHEMA", "FORGET_SCHEMA", "PROFILE_SCHEMA"))
+
+
+
+def test_recall_defaults_to_threshold_half_and_the_tool_to_the_server(api, tmp_path):
+    provider = make_provider(tmp_path)
+    provider.prefetch("email?")
+    provider.handle_tool_call("supermemory-search", {"query": "email"})
+    assert [b.get("threshold") for b in search_bodies(api)] == [0.5, None]
+    (tmp_path / "supermemory.json").write_text(json.dumps({"threshold": 0.2}))
+    api.requests.clear()
+    provider = make_provider(tmp_path, session_id="session-2")
+    provider.prefetch("email?")
+    provider.handle_tool_call("supermemory-search", {"query": "email"})
+    assert [b.get("threshold") for b in search_bodies(api)] == [0.2, 0.2]
+
+
+def test_first_run_copies_supermemory_json_into_the_panel_file(api, tmp_path):
+    legacy = {"container_tag": "old", "auto_capture": False, "entity_context": "Only names.", "threshold": 0.4}
+    (tmp_path / "supermemory.json").write_text(json.dumps(legacy))
+    make_provider(tmp_path)
+    panel = tmp_path / "supermemory" / "config.json"
+    assert json.loads(panel.read_text()) == {"container_tag": "old", "auto_capture": False, "threshold": 0.4, "memory_scope": "shared"}
+    assert json.loads((tmp_path / "supermemory.json").read_text()) == legacy
+    assert stat.S_IMODE(panel.stat().st_mode) == 0o600
+    panel.write_text(json.dumps({"memory_scope": "user"}))
+    make_provider(tmp_path)
+    assert json.loads(panel.read_text()) == {"memory_scope": "user"}
+    config = sm._load_supermemory_config(str(tmp_path))
+    assert (config["memory_scope"], config["container_tag"], config["entity_context"]) == ("user", "old", "Only names.")
+
+
+def test_first_run_keeps_a_chosen_scope_and_skips_fresh_installs(api, tmp_path):
+    make_provider(tmp_path)
+    assert not (tmp_path / "supermemory").exists()
+    scope(tmp_path, "user")
+    make_provider(tmp_path)
+    assert json.loads((tmp_path / "supermemory" / "config.json").read_text()) == {"memory_scope": "user"}
 
