@@ -935,3 +935,13 @@ def test_group_turn_merged_with_a_compaction_summary_is_still_stored(api, tmp_pa
     provider.sync_turn(merged, "Moved to 8.", messages=messages, turn_author={"id": "42", "name": None, "is_bot": False})
     assert api.captures() == {"hermes:telegram:user:42/hermes_session-1": TURN3}
 
+
+
+def test_group_turn_is_attributed_where_it_sits_when_the_transcript_runs_ahead(api, tmp_path):
+    scope(tmp_path, "user")
+    provider = make_provider(tmp_path, **{**GATEWAY, "chat_type": "group"})
+    ahead = transcript(("Book the usual table", "Booked."), ("And a cab at 7.", "Cab booked."))
+    provider.sync_turn("Book the usual table", "Booked.", messages=ahead, turn_author={"id": "42", "name": None, "is_bot": False})
+    provider.sync_turn("And a cab at 7.", "Cab booked.", messages=ahead, turn_author={"id": "7", "name": None, "is_bot": False})
+    assert api.captures() == {"hermes:telegram:user:42/hermes_session-1": TURN1, "hermes:telegram:user:7/hermes_session-1": TURN2}
+

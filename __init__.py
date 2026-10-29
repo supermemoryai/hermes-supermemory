@@ -797,8 +797,10 @@ class SupermemoryMemoryProvider(MemoryProvider):
             turns = _turns_from_messages(messages) if messages is not None else self._turns
             if completed_only and turns and not turns[-1]["assistant"]:
                 turns = turns[:-1]
-            if author and author[1] and turns:
-                self._turn_authors[len(turns) - 1] = (author[0], turns[-1]["user"])
+            own = _clean_text_for_capture(_without_compaction_summary(author[1])) if author else ""
+            synced = next((i for i in range(len(turns) - 1, -1, -1) if turns[i]["user"] == own), None) if own else None
+            if synced is not None:
+                self._turn_authors[synced] = (author[0], own)
             complete = messages is not None and not any(isinstance(m, dict) and m.get("_compressed_summary") for m in messages)
             speakers = {self._speaker_tag(a): a for a, _ in self._turn_authors.values()}
             speakers.update({tag: state["author"] for tag, state in self._speakers.items() if tag not in speakers})
