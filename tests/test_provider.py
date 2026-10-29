@@ -906,3 +906,32 @@ def test_legacy_tag_warning_names_the_file_that_wins(api, tmp_path, caplog):
     make_provider(tmp_path, agent_identity="coder")
     assert "set the old name in supermemory/config.json" in caplog.text
 
+
+
+def test_group_keeps_repeated_identical_turns_and_drops_one_rewound_copy(api, tmp_path):
+    scope(tmp_path, "user")
+    group = {**GATEWAY, "chat_type": "group"}
+    again = ("continue", "Continuing.")
+    once = transcript(("Book the usual table", "Booked."), again)
+    first = make_provider(tmp_path, **group)
+    group_turn(first, "42", once[:4])
+    group_turn(first, "42", once)
+    twice = once + transcript(again)
+    group_turn(make_provider(tmp_path, **group), "42", twice)
+    mine = "hermes:telegram:user:42/hermes_session-1"
+    cont = "[role: user]\ncontinue\n[user:end]\n[role: assistant]\nContinuing.\n[assistant:end]"
+    assert api.captures()[mine] == "\n\n".join((TURN1, cont, cont))
+    group_turn(make_provider(tmp_path, **group), "42", once + transcript(("And a cab at 7.", "Cab booked.")))
+    assert api.captures()[mine] == "\n\n".join((TURN1, cont, TURN2))
+
+
+def test_group_turn_merged_with_a_compaction_summary_is_still_stored(api, tmp_path):
+    scope(tmp_path, "user")
+    provider = make_provider(tmp_path, **{**GATEWAY, "chat_type": "group"})
+    merged = ("[PRIOR CONTEXT — for reference only; not a new message]\nMake it 8 instead.\n\n"
+              "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]\n\n" + SUMMARY)
+    messages = [{"role": "user", "content": merged, "_compressed_summary": True}, {"role": "assistant", "content": "Moved to 8."}]
+    provider.on_turn_start(1, merged, author_id="42")
+    provider.sync_turn(merged, "Moved to 8.", messages=messages, turn_author={"id": "42", "name": None, "is_bot": False})
+    assert api.captures() == {"hermes:telegram:user:42/hermes_session-1": TURN3}
+

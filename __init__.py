@@ -9,6 +9,7 @@ import logging
 import re
 import threading
 import urllib.parse
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -779,15 +780,25 @@ class SupermemoryMemoryProvider(MemoryProvider):
             return None
         return [{"user": u, "assistant": a} for u, a in _STORED_TURN_RE.findall(stored)]
 
-    # Turns are attributed by their place in the transcript, and without a compaction the transcript is the whole truth, so stored turns it no longer holds were rewound.
+    # Without a compaction the transcript is the whole truth: a speaker owns the places they wrote plus as many matching places as their document stores.
+    def _speaker_turns(self, speaker: str, stored: List[Dict[str, str]], turns: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        owners = {i: a for i, (a, user) in self._turn_authors.items() if i < len(turns) and turns[i]["user"] == user}
+        remaining, owned = Counter((t["user"], t["assistant"]) for t in stored), []
+        for i, turn in enumerate(turns):
+            key = (turn["user"], turn["assistant"])
+            if owners.get(i, speaker if remaining[key] > 0 else None) == speaker:
+                remaining[key] -= 1
+                owned.append(turn)
+        return owned
+
     def _capture_speakers(self, mode: str, messages: Optional[list], *, completed_only: bool = False, author: Optional[tuple] = None) -> None:
         with self._capture_lock:
             self._retry_pending(mode)
             turns = _turns_from_messages(messages) if messages is not None else self._turns
             if completed_only and turns and not turns[-1]["assistant"]:
                 turns = turns[:-1]
-            if author and author[1] and turns and turns[-1]["user"] == author[1]:
-                self._turn_authors[len(turns) - 1] = author
+            if author and author[1] and turns:
+                self._turn_authors[len(turns) - 1] = (author[0], turns[-1]["user"])
             complete = messages is not None and not any(isinstance(m, dict) and m.get("_compressed_summary") for m in messages)
             speakers = {self._speaker_tag(a): a for a, _ in self._turn_authors.values()}
             speakers.update({tag: state["author"] for tag, state in self._speakers.items() if tag not in speakers})
@@ -800,8 +811,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
                     state["archive"] = self._stored_turns(tag)
                 if state["archive"] is None:
                     continue
-                kept = [t for t in state["archive"] if not complete or t in turns]
-                state["content_turns"] = kept + [t for t in state["turns"] if t not in kept]
+                state["content_turns"] = (self._speaker_turns(speaker, state["archive"], turns) if complete
+                                          else _join_turns(state["archive"], state["turns"]))
                 content = "\n\n".join(_format_turn(t["user"], t["assistant"]) for t in state["content_turns"])
                 digest = hashlib.sha256(content.encode()).hexdigest()
                 if not content or (digest == state["digest"] and state["unsent"] is None):
