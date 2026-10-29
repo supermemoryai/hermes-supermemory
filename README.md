@@ -46,27 +46,36 @@ the endpoint first ensures the setup connection probe also stays local.
 
 ## Config
 
-Config file: `$HERMES_HOME/supermemory.json`
+Config files: `$HERMES_HOME/supermemory.json`, and `$HERMES_HOME/supermemory/config.json`, which the config panel in the Hermes dashboard and Desktop writes. A value set in the panel wins, and once that file exists `hermes memory setup` writes there too. On the first run an existing `supermemory.json` is copied there, so after that, edit settings in the panel or in `supermemory/config.json`.
 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `base_url` | `https://api.supermemory.ai` | API endpoint for hosted or self-hosted Supermemory. Takes priority over `SUPERMEMORY_BASE_URL`. |
 | `container_tag` | `hermes` | Container tag (namespace) used for search and writes. Supports `{identity}` template for profile-scoped tags (e.g. `hermes-{identity}` → `hermes-coder`). Letters, digits, `_`, `-` and `:` are kept; other characters become `_`. Tags over 100 characters are shortened to 100, ending in `_` and an 8-character hash of the full tag so they stay distinct. |
+| `memory_scope` | `shared` | Gateway bots only: `user` gives each person their own container, `chat` each conversation, `shared` one for everyone. CLI and Desktop always use `container_tag`. New setups choose `user`. |
 | `auto_recall` | `true` | Inject relevant memory context before turns |
 | `auto_capture` | `true` | Store cleaned user-assistant turns after each response |
 | `max_recall_results` | `10` | Max search results recalled with the profile (1-20) |
-| `profile_frequency` | `50` | Include profile facts on the first turn and every N turns |
-| `capture_mode` | `all` | Skip tiny or trivial turns by default |
-| `search_mode` | `hybrid` | Search mode: `hybrid`, `memories` (memories only), `chunks` (document excerpts only; `documents` is accepted as before) |
+| `threshold` | unset | Minimum similarity (0-1). Automatic recall uses 0.5 when unset and searches memories only; the search tool uses the server default unless this is set |
+| `profile_frequency` | `50` | Include profile facts on the first turn, after a compaction, and every N turns |
+| `search_mode` | `hybrid` | Default mode of the search tool: `hybrid`, `memories` (memories only), `chunks` (document excerpts only; `documents` is accepted as before) |
+| `rerank` | `none` | `order` re-ranks results. The search tool can also ask for `aggregate`, which merges overlapping results |
+| `rewrite_query` | `false` | Rewrite the query before searching (about 400 ms slower) |
+| `include_documents`, `include_related`, `include_forgotten` | `false` | Add each result's source document, related memories, or forgotten memories |
+| `allow_agent_search_overrides` | `true` | Let the search tool pick `search_mode` and `aggregate`; `false` always uses the config |
 | `entity_context` | built-in default | Extraction guidance passed to Supermemory |
 | `dreaming` | `dynamic` | `dynamic` groups related conversations before forming memories; `instant` processes each one right away (billed as one extra operation) |
 | `api_timeout` | `5.0` | Timeout for SDK requests |
+
+### Gateway memory scope
+
+Existing bots keep `shared`, so every user shares one container. To switch, choose "Per user" in the panel or set `"memory_scope": "user"` in `supermemory/config.json`; memories saved while shared stay in the old container.
 
 ### Upgrading from 1.0.1
 
 1.0.1 changed `-` and `:` in tags to `_`, so `hermes-coder` was saved as `hermes_coder`. From 1.0.2 tags are kept as written, so memories saved before the upgrade stay under the old name. The plugin logs the old and new name once.
 
-To keep those memories, either set the old name in `supermemory.json` (`"container_tag": "hermes_coder"`), or have an org admin merge `hermes_coder` into `hermes-coder` from the Namespaces page at console.supermemory.ai after your first save on 1.0.2.
+To keep those memories, either set the old name in the panel or `supermemory/config.json` (`"container_tag": "hermes_coder"`), or have an org admin merge `hermes_coder` into `hermes-coder` from the Namespaces page at console.supermemory.ai after your first save on 1.0.2.
 
 ### Environment Variables
 
@@ -82,7 +91,7 @@ for SDK operations and setup/status probes.
 
 ## Tools
 
-Kebab-case names are registered for the agent; snake_case aliases remain supported.
+Only the kebab-case names are sent to the model; calls using the snake_case names still work.
 
 | Tool | Alias | Description |
 |------|-------|-------------|
@@ -104,11 +113,12 @@ Supermemory app, so you can filter, browse, and bulk-manage them per source agen
 
 When enabled, Hermes can:
 
-- before each turn, recall relevant memories, plus profile facts on the first turn and every `profile_frequency` turns
+- before each turn, recall relevant memories not already shown in the conversation, plus profile facts on the first turn, after a compaction, and every `profile_frequency` turns; the profile is fetched in the background, so only the search delays a turn
+- show "recalled N memories" when it adds context
 - after each completed turn, save the conversation so far as **one document per conversation**, rewritten in full, so undo, edits and context compaction never store it twice
 - skip a save when nothing changed, and retry a failed one later (up to 50 conversations); a failed save is logged and never breaks the turn
 - store messages as given (only the plugin's own recalled `<supermemory-context>` block and inline base64 images are left out)
-- copy built-in `memory` tool additions into Supermemory
+- copy built-in `memory` tool additions, edits and removals into Supermemory
 - route every SDK and probe request through the configured hosted or self-hosted endpoint
 - expose explicit tools for search, store, forget, profile, and reading documents
 

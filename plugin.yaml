@@ -1,7 +1,6 @@
 name: supermemory
 version: 2.0.0
 description: "Supermemory semantic long-term memory with profile recall, semantic search, explicit memory tools, and per-turn capture into one document per conversation."
+requires_hermes: ">=0.22.0"
 requires_env:
   - SUPERMEMORY_API_KEY
-pip_dependencies:
-  - "supermemory>=5.0.0,<6"
