@@ -50,9 +50,9 @@ _FAILED_HTML = _page("Connection failed", "#ef4444", "Return to Hermes and run l
 
 
 class AuthError(Exception):
-    def __init__(self, message: str, code: str = "oauth_error"):
+    def __init__(self, message: str, code: str = "oauth_error", status: Optional[int] = None):
         super().__init__(message)
-        self.code = code
+        self.code, self.status = code, status
 
 
 def _plugin_version() -> str:
@@ -198,7 +198,7 @@ def _request(url: str, *, form: Optional[dict] = None, body: Optional[dict] = No
     result = payload if isinstance(payload, dict) else {}
     if not 200 <= status < 300:
         code = result.get("error") if result.get("error") in _KNOWN_ERRORS else "oauth_request_failed"
-        raise AuthError(f"Supermemory authorization failed ({code}, HTTP {status}).", code)
+        raise AuthError(f"Supermemory authorization failed ({code}, HTTP {status}).", code, status)
     return result
 
 
@@ -296,8 +296,13 @@ def logout() -> Optional[dict]:
     with _auth_lock(REQUEST_TIMEOUT):
         saved = load_credentials()
         if saved and saved.get("refreshToken"):
-            _request(_issuer_endpoint(saved["revocationEndpoint"], saved["issuer"]),
-                     form={"client_id": saved["clientId"], "token": saved["refreshToken"], "token_type_hint": "refresh_token"})
+            try:
+                _request(_issuer_endpoint(saved["revocationEndpoint"], saved["issuer"]),
+                         form={"client_id": saved["clientId"], "token": saved["refreshToken"], "token_type_hint": "refresh_token"})
+            except AuthError as error:
+                # A 4xx means the server no longer honors the token (revoked or disconnected), so sign out locally anyway.
+                if not (error.status and 400 <= error.status < 500):
+                    raise
         _credentials_file().unlink(missing_ok=True)
         return saved
 

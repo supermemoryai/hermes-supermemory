@@ -28,7 +28,7 @@ class FakeIssuer:
     """The authorization server behind ``auth._request``: records calls and issues numbered tokens."""
 
     def __init__(self):
-        self.calls, self.issued, self.refresh_error = [], 0, ""
+        self.calls, self.issued, self.refresh_error, self.revoke_status = [], 0, "", 0
 
     def __call__(self, url, *, form=None, body=None, token=""):
         self.calls.append({"url": url, "form": form, "body": body})
@@ -39,6 +39,8 @@ class FakeIssuer:
         if path.endswith("/oauth2/registration"):
             return {"client_id": "client-1", "token_endpoint_auth_method": "none"}
         if path.endswith("/oauth2/revocation"):
+            if self.revoke_status:
+                raise auth.AuthError("refused", "oauth_request_failed", self.revoke_status)
             return {}
         if path.endswith("/oauth2/token"):
             if form["grant_type"] == "refresh_token" and self.refresh_error:

@@ -95,6 +95,19 @@ def test_logout_revokes_the_refresh_token_and_deletes_the_file(issuer, credentia
     assert auth.logout() is None
 
 
+@pytest.mark.parametrize("status, kept", [(400, False), (503, True)])
+def test_logout_signs_out_unless_the_server_could_not_answer(issuer, credentials_dir, status, kept):
+    # Production answers 400 "token not found" for a token already revoked, e.g. after Disconnect in the console.
+    save_sign_in()
+    issuer.revoke_status = status
+    if kept:
+        with pytest.raises(auth.AuthError):
+            auth.logout()
+    else:
+        assert auth.logout()["refreshToken"] == "refresh-0"
+    assert (credentials_dir / "credentials.json").exists() is kept
+
+
 def test_oauth_is_for_supermemory_cloud_only(monkeypatch):
     with pytest.raises(auth.AuthError, match="SUPERMEMORY_API_KEY"):
         auth.oauth_config("http://localhost:6767")
