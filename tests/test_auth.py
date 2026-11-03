@@ -51,9 +51,12 @@ def test_print_url_login_prints_one_link_and_finishes_when_the_code_arrives(issu
         "client-1", f"http://127.0.0.1:{port}/callback", "S256")
     assert (params["scope"], params["resource"]) == ("openid profile email offline_access", "https://mcp.supermemory.ai/mcp")
 
+    idle = socket.create_connection(("127.0.0.1", port))
     assert callback_status(f"{params['redirect_uri']}?code=stolen&state=wrong") == 400
     assert callback_status(f"{params['redirect_uri']}?code=c1&state={params['state']}&iss={ISSUER}") == 200
     thread.join(10)
+    idle.close()
+    assert not thread.is_alive()
 
     exchange = issuer.token_requests()[0]
     challenge = base64.urlsafe_b64encode(hashlib.sha256(exchange["code_verifier"].encode()).digest()).rstrip(b"=").decode()
@@ -95,7 +98,7 @@ def test_logout_revokes_the_refresh_token_and_deletes_the_file(issuer, credentia
     assert auth.logout() is None
 
 
-@pytest.mark.parametrize("status, kept", [(400, False), (503, True)])
+@pytest.mark.parametrize("status, kept", [(400, False), (401, False), (429, True), (503, True)])
 def test_logout_signs_out_unless_the_server_could_not_answer(issuer, credentials_dir, status, kept):
     # Production answers 400 "token not found" for a token already revoked, e.g. after Disconnect in the console.
     save_sign_in()

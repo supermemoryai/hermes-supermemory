@@ -20,7 +20,7 @@ import uuid
 import webbrowser
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, Tuple
 
@@ -35,6 +35,7 @@ REFRESH_SKEW_MS = 60_000
 _CLIENT_FIELDS = ("apiBaseUrl", "issuer", "resource", "clientId", "redirectUri",
                   "authorizationEndpoint", "tokenEndpoint", "revocationEndpoint")
 _KNOWN_ERRORS = ("invalid_grant", "invalid_client", "access_denied")
+_TOKEN_GONE_STATUSES = (400, 401)
 
 
 def _page(heading: str, color: str, message: str) -> str:
@@ -300,17 +301,24 @@ def logout() -> Optional[dict]:
                 _request(_issuer_endpoint(saved["revocationEndpoint"], saved["issuer"]),
                          form={"client_id": saved["clientId"], "token": saved["refreshToken"], "token_type_hint": "refresh_token"})
             except AuthError as error:
-                # A 4xx means the server no longer honors the token (revoked or disconnected), so sign out locally anyway.
-                if not (error.status and 400 <= error.status < 500):
+                if error.status not in _TOKEN_GONE_STATUSES:
                     raise
         _credentials_file().unlink(missing_ok=True)
         return saved
+
+
+# Each connection gets its own daemon thread, so an idle browser socket blocks neither the callback nor shutdown.
+class _CallbackServer(ThreadingHTTPServer):
+    daemon_threads = True
+    block_on_close = False
 
 
 def _callback_handler(client: dict, state: str, verifier: str, outcome: dict, done: threading.Event):
     claim = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
+        timeout = REQUEST_TIMEOUT
+
         def log_message(self, *args: Any) -> None:
             pass
 
@@ -384,7 +392,7 @@ def login(config: Dict[str, str], *, print_url: bool = False, timeout: Optional[
         outcome: dict = {}
         done = threading.Event()
         try:
-            server = HTTPServer(("127.0.0.1", AUTH_PORT), _callback_handler(client, state, verifier, outcome, done))
+            server = _CallbackServer(("127.0.0.1", AUTH_PORT), _callback_handler(client, state, verifier, outcome, done))
         except OSError as error:
             raise AuthError(f"Cannot open the sign-in callback port {AUTH_PORT}. Retry after other logins finish.",
                             "port_in_use") from error
