@@ -18,6 +18,11 @@ from agent.secret_scope import get_secret
 from tools.registry import tool_error
 
 try:
+    from . import auth as _auth
+except ImportError:
+    import auth as _auth
+
+try:
     from agent.memory_provider import spawn_context_thread
 except ImportError:  # older Hermes: plain threads
     def spawn_context_thread(target, *, name, daemon=True, args=(), kwargs=None):
@@ -228,13 +233,14 @@ class _SupermemoryClient:
     """Supermemory v5: the container tag is the namespace every call reads and writes."""
 
     def __init__(self, api_key: str, timeout: float, container_tag: str,
-                 search_mode: str = "hybrid", base_url: str = ""):
+                 search_mode: str = "hybrid", base_url: str = "", oauth: Optional[dict] = None):
         self._sm = _load_sdk()
         self._api_key, self._container_tag, self._timeout = api_key, container_tag, timeout
         self._search_mode = search_mode if search_mode in _VALID_SEARCH_MODES else "hybrid"
         self._base_url = _resolve_base_url(base_url)
         self._client = self._sm.Supermemory(api_key=api_key, base_url=self._base_url, timeout=timeout, max_retries=0,
-                                            default_headers={"x-sm-source": "hermes"})
+                                            default_headers={"x-sm-source": "hermes"},
+                                            **({"http_client": _oauth_http_client(oauth, timeout)} if oauth else {}))
 
     def _merge_metadata(self, metadata: Optional[dict]) -> dict:
         # sm_source routes Hermes writes into the "Hermes" Space in the Supermemory app so the user
@@ -320,6 +326,28 @@ class _SupermemoryClient:
         return {"success": True, "message": f'Forgot: "{(results[0].get("memory") or "")[:100]}"', "id": memory_id}
 
 
+# Every SDK request gets a fresh OAuth access token; a 401 refreshes it once and retries.
+def _oauth_http_client(oauth: dict, timeout: float):
+    import httpx
+
+    class _OAuthBearer(httpx.Auth):
+        def auth_flow(self, request):
+            token = _auth.access_token(oauth)
+            request.headers["Authorization"] = f"Bearer {token}"
+            response = yield request
+            if response.status_code == 401:
+                request.headers["Authorization"] = f"Bearer {_auth.access_token(oauth, rejected=token)}"
+                yield request
+
+    return httpx.Client(auth=_OAuthBearer(), timeout=timeout, follow_redirects=True)
+
+
+# OAuth settings for base_url when a saved sign-in matches it; only consulted when no API key is configured.
+def _signed_in(base_url: str) -> Optional[dict]:
+    config = _quietly(lambda: _auth.oauth_config(base_url))
+    return config if config and _quietly(lambda: _auth.has_oauth_credentials(config), default=False) else None
+
+
 def _format_turn(user: str, assistant: str) -> str:
     """Render one turn in the [role: x]...[x:end] layout the entity context describes."""
     return "\n".join(f"[role: {role}]\n{text}\n[{role}:end]" for role, text in (("user", user), ("assistant", assistant)) if text)
@@ -367,9 +395,9 @@ def _join_turns(archive: List[Dict[str, str]], turns: List[Dict[str, str]]) -> L
     return archive + rest[tail:]
 
 
-def _build_client(api_key: str, config: dict, container_tag: str) -> _SupermemoryClient:
+def _build_client(api_key: str, config: dict, container_tag: str, oauth: Optional[dict] = None) -> _SupermemoryClient:
     return _SupermemoryClient(api_key=api_key, timeout=config["api_timeout"], container_tag=container_tag,
-                              search_mode=config["search_mode"], base_url=_resolve_base_url(config["base_url"]))
+                              search_mode=config["search_mode"], base_url=_resolve_base_url(config["base_url"]), oauth=oauth)
 
 
 def _expand_container_tag(config_tag: str, identity: str) -> str:
@@ -382,18 +410,32 @@ def _probe_supermemory_connection(api_key: str, hermes_home: str, *, identity: s
     config = _load_supermemory_config(hermes_home)
     status = {"ok": False, "error": "", "profile_facts": 0, "container_tag": _sanitize_tag(_expand_container_tag(config["container_tag"], identity)),
               "auto_recall": bool(config["auto_recall"]), "auto_capture": bool(config["auto_capture"])}
-    if not (api_key or "").strip():
-        return {**status, "error": "SUPERMEMORY_API_KEY not set"}
+    api_key = (api_key or "").strip()
+    oauth = None if api_key else _signed_in(_resolve_base_url(config["base_url"]))
+    if not api_key and not oauth:
+        return {**status, "error": f"not signed in: run `{_auth.login_command()}` or set SUPERMEMORY_API_KEY"}
     try:
         _load_sdk()
     except ImportError as exc:
         return {**status, "error": str(exc)}
     try:
-        profile = _build_client(api_key.strip(), config, status["container_tag"]).get_profile()
+        profile = _build_client(api_key, config, status["container_tag"], oauth=oauth).get_profile()
     except Exception as exc:
         return {**status, "error": str(exc).strip()[:160] or "connection failed"}
     facts = sum(1 for line in (profile or "").splitlines() if line.startswith("- "))
-    return {**status, "ok": True, "profile_facts": facts}
+    return {**status, "ok": True, "profile_facts": facts, "auth": "oauth" if oauth else "api_key"}
+
+
+def _sign_in_interactively(base_url: str) -> None:
+    try:
+        oauth = _auth.oauth_config(base_url)
+        if _auth.has_oauth_credentials(oauth):
+            print("  Already signed in to Supermemory.")
+            return
+        _auth.login(oauth)
+        print("  ✓ Signed in to Supermemory")
+    except _auth.AuthError as error:
+        print(f"  ✗ Sign-in failed: {error}")
 
 
 def _format_connection_summary(status: dict) -> str:
@@ -401,7 +443,7 @@ def _format_connection_summary(status: dict) -> str:
     flags = f"auto_recall {'on' if status.get('auto_recall') else 'off'} · auto_capture {'on' if status.get('auto_capture') else 'off'}"
     if status.get("ok"):
         facts = int(status.get("profile_facts") or 0)
-        return f"✓ Connected · container: {container} · {facts} profile {'fact' if facts == 1 else 'facts'} · {flags}"
+        return f"✓ Connected{' via OAuth' if status.get('auth') == 'oauth' else ''} · container: {container} · {facts} profile {'fact' if facts == 1 else 'facts'} · {flags}"
     return f"✗ {status.get('error') or 'connection failed'} · container: {container} · {flags}"
 
 
@@ -460,13 +502,17 @@ class SupermemoryMemoryProvider(MemoryProvider):
         return "supermemory"
 
     def is_available(self) -> bool:
-        # Key presence only, no SDK import check: the SDK is lazy-installed in initialize(), so gating on
+        # Credentials only, no SDK import check: the SDK is lazy-installed in initialize(), so gating on
         # importability here is a chicken-and-egg trap on sealed venvs. Mirrors honcho/mem0.
-        return bool(get_secret("SUPERMEMORY_API_KEY", ""))
+        if get_secret("SUPERMEMORY_API_KEY", ""):
+            return True
+        from hermes_constants import get_hermes_home
+        return _signed_in(_resolve_base_url(_load_supermemory_config(str(get_hermes_home()))["base_url"])) is not None
 
     def get_config_schema(self):
         # Only the API key is prompted during `hermes memory setup`; other options live in supermemory.json / env.
-        return [{"key": "api_key", "description": "Supermemory API key", "secret": True, "required": True, "env_var": "SUPERMEMORY_API_KEY", "url": _API_KEY_URL}]
+        return [{"key": "api_key", "description": "Supermemory API key (optional: leave blank to sign in with your browser)",
+                 "secret": True, "required": False, "env_var": "SUPERMEMORY_API_KEY", "url": _API_KEY_URL}]
 
     def save_config(self, values, hermes_home):
         sanitized = dict(values or {})
@@ -482,15 +528,22 @@ class SupermemoryMemoryProvider(MemoryProvider):
     def post_setup(self, hermes_home: str, config: dict) -> None:
         from hermes_cli.config import save_config
         from hermes_cli.memory_setup import _prompt, _write_env_vars
-        print(f"\n  Configuring supermemory:\n\n  Get your API key at {_API_KEY_URL}\n")
         existing = get_secret("SUPERMEMORY_API_KEY", "") or ""
-        masked = f"...{existing[-4:]}" if len(existing) > 4 else "set"
-        val = _prompt(f"Supermemory API key (current: {masked}, blank to keep)" if existing else "Supermemory API key", secret=True)
+        if existing:
+            print(f"\n  Configuring supermemory:\n\n  Get your API key at {_API_KEY_URL}\n")
+            masked = f"...{existing[-4:]}" if len(existing) > 4 else "set"
+            val = _prompt(f"Supermemory API key (current: {masked}, blank to keep)", secret=True)
+        else:
+            print(f"\n  Configuring supermemory:\n\n  Press Enter to sign in with your Supermemory account in the browser,\n"
+                  f"  or paste an API key from {_API_KEY_URL}\n")
+            val = _prompt("Supermemory API key (blank to sign in with your browser)", secret=True)
         memory = config["memory"] = config["memory"] if isinstance(config.get("memory"), dict) else {}
         memory["provider"] = self.name
         save_config(config)
         if val:
             _write_env_vars({"SUPERMEMORY_API_KEY": val}, hermes_home=hermes_home)
+        elif not existing:
+            _sign_in_interactively(_resolve_base_url(_load_supermemory_config(hermes_home)["base_url"]))
         status = _probe_supermemory_connection(val or existing, hermes_home)
         print(f"\n  {_format_connection_summary(status)}\n\n  Memory provider: supermemory\n  Activation saved to config.yaml")
         if val:
@@ -508,8 +561,11 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._container_tag = _sanitize_tag(raw_tag)
         self._apply_config(config)
         self._write_enabled = kwargs.get("agent_context", "") not in {"cron", "flush", "subagent"}
-        self._client = _quietly(lambda: _build_client(self._api_key, config, self._container_tag),
-                                "Supermemory initialization failed", level=logging.WARNING) if self._api_key else None
+        oauth = None if self._api_key else _signed_in(self._base_url)
+        if not self._api_key and not oauth and _quietly(_auth.load_credentials):
+            logger.warning("Supermemory is inactive: %s", _auth.auth_required())
+        self._client = _quietly(lambda: _build_client(self._api_key, config, self._container_tag, oauth=oauth),
+                                "Supermemory initialization failed", level=logging.WARNING) if self._api_key or oauth else None
         self._active = self._client is not None
         if self._active:
             self._warn_legacy_tags_once([raw_tag] + (config["custom_containers"] if self._enable_custom_containers else []))
