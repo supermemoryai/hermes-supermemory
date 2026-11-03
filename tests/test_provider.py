@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 import hermes_supermemory as sm
+from conftest import save_sign_in
 from hermes_supermemory import SupermemoryMemoryProvider
 
 supermemory = pytest.importorskip("supermemory")
@@ -100,8 +101,8 @@ def clean_env(monkeypatch):
 def api(monkeypatch, tmp_path):
     fake = FakeAPI()
     real = supermemory.Supermemory
-    monkeypatch.setattr(supermemory, "Supermemory",
-                        lambda **options: real(http_client=httpx.Client(transport=httpx.MockTransport(fake)), **options))
+    monkeypatch.setattr(supermemory, "Supermemory", lambda http_client=None, **options: real(
+        http_client=httpx.Client(transport=httpx.MockTransport(fake), auth=http_client.auth if http_client else None), **options))
     monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
     return fake
 
@@ -131,6 +132,48 @@ def test_needs_only_an_api_key(monkeypatch):
     assert SupermemoryMemoryProvider().is_available() is False
     monkeypatch.setenv("SUPERMEMORY_API_KEY", "k")
     assert SupermemoryMemoryProvider().is_available() is True
+
+
+def test_oauth_sign_in_is_used_only_without_an_api_key(api, issuer, monkeypatch, tmp_path):
+    monkeypatch.delenv("SUPERMEMORY_API_KEY")
+    assert SupermemoryMemoryProvider().is_available() is False
+    save_sign_in()
+    assert SupermemoryMemoryProvider().is_available() is True
+    make_provider(tmp_path).handle_tool_call("supermemory_search", {"query": "coffee"})
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+    make_provider(tmp_path).handle_tool_call("supermemory_search", {"query": "coffee"})
+    assert [r["headers"]["authorization"] for r in api.requests] == ["Bearer access-0", "Bearer test-key"]
+    assert issuer.calls == []
+
+
+def test_a_401_refreshes_the_oauth_token_once_and_retries(api, issuer, monkeypatch, tmp_path):
+    monkeypatch.delenv("SUPERMEMORY_API_KEY")
+    save_sign_in()
+    api.failures.append(("/search", 401))
+    result = json.loads(make_provider(tmp_path).handle_tool_call("supermemory_search", {"query": "coffee"}))
+    assert result["count"] == 1
+    assert [r["headers"]["authorization"] for r in api.requests] == ["Bearer access-0", "Bearer access-1"]
+    assert sm._auth.load_credentials()["refreshToken"] == "refresh-1"
+
+
+def test_an_expired_sign_in_reports_how_to_sign_in_again(api, issuer, monkeypatch, tmp_path):
+    monkeypatch.delenv("SUPERMEMORY_API_KEY")
+    save_sign_in()
+    provider = make_provider(tmp_path)
+    save_sign_in(expires_in_ms=0)
+    issuer.refresh_error = "invalid_grant"
+    assert "auth.py login" in json.loads(provider.handle_tool_call("supermemory_search", {"query": "coffee"}))["error"]
+    assert api.requests == [] and SupermemoryMemoryProvider().is_available() is False
+
+
+def test_a_self_hosted_base_url_still_needs_an_api_key(api, monkeypatch, tmp_path):
+    save_sign_in()
+    monkeypatch.setenv("SUPERMEMORY_BASE_URL", "http://localhost:6767")
+    monkeypatch.delenv("SUPERMEMORY_API_KEY")
+    assert SupermemoryMemoryProvider().is_available() is False
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+    make_provider(tmp_path).handle_tool_call("supermemory_search", {"query": "coffee"})
+    assert api.requests[0]["headers"]["authorization"] == "Bearer test-key"
 
 
 def test_config_file_and_normalization(tmp_path):

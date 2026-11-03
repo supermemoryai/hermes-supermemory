@@ -7,7 +7,7 @@ Semantic long-term memory with profile recall, semantic search, explicit memory 
 ## Requirements
 
 - The official SDK, `supermemory>=5.0.0,<6` (declared in `pyproject.toml`; Hermes installs it with the plugin)
-- Hosted: API key from [console.supermemory.ai/keys](https://console.supermemory.ai/keys?create=true)
+- Hosted: a Supermemory account (sign in with your browser), or an API key from [console.supermemory.ai/keys](https://console.supermemory.ai/keys?create=true)
 - Self-hosted: a running [Supermemory local](https://supermemory.ai/docs/self-hosting/overview) server and the API key it prints on first boot
 
 ## Setup
@@ -15,13 +15,38 @@ Semantic long-term memory with profile recall, semantic search, explicit memory 
 ```bash
 hermes plugins install supermemoryai/hermes-supermemory
 hermes plugins enable supermemory
-hermes memory setup    # select "supermemory"
+hermes memory setup    # select "supermemory", then press Enter to sign in with your browser
 ```
 
 Or manually:
 
 ```bash
 hermes config set memory.provider supermemory
+python3 ~/.hermes/plugins/supermemory/auth.py login
+```
+
+### Sign in
+
+The plugin signs in with your Supermemory account over OAuth. `login` opens your browser; on a
+machine without one, add `--print-url` and open the printed link anywhere (the callback listens on
+`127.0.0.1:19884`, so a remote box needs that port forwarded). Credentials are saved to
+`~/.supermemory-hermes/credentials.json` (mode 0600) and refreshed automatically. If the sign-in is
+revoked or expires, run `login` again.
+
+```bash
+python3 ~/.hermes/plugins/supermemory/auth.py login     # sign in (opens a browser)
+python3 ~/.hermes/plugins/supermemory/auth.py status    # OAuth or API key, and the account
+python3 ~/.hermes/plugins/supermemory/auth.py logout    # revoke the refresh token and delete the file
+```
+
+Use `$HERMES_HOME/plugins/supermemory/auth.py` if `HERMES_HOME` is not `~/.hermes`.
+
+### API key (fallback)
+
+An API key still works exactly as before and takes priority over the OAuth sign-in. Paste it during
+`hermes memory setup`, or:
+
+```bash
 echo 'SUPERMEMORY_API_KEY=***' >> ~/.hermes/.env
 ```
 
@@ -42,7 +67,8 @@ Before running `hermes memory setup`, add the local endpoint to
 ```
 
 Then run `hermes memory setup` and enter the local server's API key. Configuring
-the endpoint first ensures the setup connection probe also stays local.
+the endpoint first ensures the setup connection probe also stays local. OAuth sign-in is only
+available for Supermemory cloud, so self-hosted and custom endpoints always use an API key.
 
 ## Config
 
@@ -72,7 +98,7 @@ To keep those memories, either set the old name in `supermemory.json` (`"contain
 
 | Variable | Description |
 |----------|-------------|
-| `SUPERMEMORY_API_KEY` | API key (required) |
+| `SUPERMEMORY_API_KEY` | API key. Optional when signed in with OAuth; takes priority over the sign-in when set |
 | `SUPERMEMORY_BASE_URL` | Compatibility fallback for the API endpoint when `base_url` is not configured |
 | `SUPERMEMORY_CONTAINER_TAG` | Override the container tag / namespace (takes priority over config file) |
 

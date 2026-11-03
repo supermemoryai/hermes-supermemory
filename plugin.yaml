@@ -1,7 +1,10 @@
 name: supermemory
-version: 2.0.0
+version: 2.1.0
 description: "Supermemory semantic long-term memory with profile recall, semantic search, explicit memory tools, and per-turn capture into one document per conversation."
-requires_env:
-  - SUPERMEMORY_API_KEY
+optional_env:
+  - name: SUPERMEMORY_API_KEY
+    description: "Supermemory API key; leave unset to sign in with your Supermemory account instead"
+    url: https://console.supermemory.ai/keys?create=true
+    secret: true
 pip_dependencies:
   - "supermemory>=5.0.0,<6"
