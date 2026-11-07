@@ -126,7 +126,19 @@ _CONFIG_SPEC: Dict[str, tuple] = {
     "enable_custom_container_tags": (False, lambda v: _as_bool(v, False)),
     "custom_containers": ([], lambda v: [str(t) for t in v if t] if isinstance(v, list) else []),
     "custom_container_instructions": ("", lambda v: str(v).strip()),
+    "captureSubagents": (False, lambda v: _as_bool(v, False)),
+    "captureHeadless": (False, lambda v: _as_bool(v, False)),
 }
+
+
+# Hermes marks a finite `hermes -z` / `chat -q` run itself (agent/oneshot_footprint.py, gateway/session_finite.py).
+def _host_headless() -> bool:
+    try:
+        from agent.oneshot_footprint import is_single_query_session
+        from gateway.session_finite import finite_turn_required
+    except ImportError:  # older Hermes: no one-shot marker to read
+        return False
+    return bool(_quietly(lambda: is_single_query_session() or finite_turn_required() is True, default=False))
 
 
 def _read_json_dict(path: Path) -> dict:
@@ -438,7 +450,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
     def __init__(self):
         self._api_key = self._session_id = self._hermes_home = ""
         self._client: Optional[_SupermemoryClient] = None
-        self._container_tag, self._write_enabled, self._active = _DEFAULT_CONTAINER_TAG, True, False
+        self._container_tag, self._write_enabled, self._active, self._hooks_enabled = _DEFAULT_CONTAINER_TAG, True, False, True
         self._write_thread = None
         self._turn_count = 0
         self._reset_capture("")
@@ -507,7 +519,15 @@ class SupermemoryMemoryProvider(MemoryProvider):
         raw_tag = _expand_container_tag(config["container_tag"], kwargs.get("agent_identity", "default"))
         self._container_tag = _sanitize_tag(raw_tag)
         self._apply_config(config)
-        self._write_enabled = kwargs.get("agent_context", "") not in {"cron", "flush", "subagent"}
+        context = kwargs.get("agent_context", "")
+        self._write_enabled = context not in {"cron", "flush", "subagent"}
+        opt_in = {key: _as_bool(get_secret(env, "") or "", config[key]) for key, env in
+                  (("captureSubagents", "SUPERMEMORY_CAPTURE_SUBAGENTS"), ("captureHeadless", "SUPERMEMORY_CAPTURE_HEADLESS"))}
+        # Subagent and helper forks, cron jobs and one-shot runs make no automatic calls unless opted in.
+        self._hooks_enabled = not ((context in {"subagent", "flush"} and not opt_in["captureSubagents"])
+                                   or ((context == "cron" or _host_headless()) and not opt_in["captureHeadless"]))
+        if not self._hooks_enabled:
+            logger.debug("Supermemory: no recall or capture for this session (agent_context=%s)", context or "primary")
         self._client = _quietly(lambda: _build_client(self._api_key, config, self._container_tag),
                                 "Supermemory initialization failed", level=logging.WARNING) if self._api_key else None
         self._active = self._client is not None
@@ -539,10 +559,10 @@ class SupermemoryMemoryProvider(MemoryProvider):
         return "\n".join(lines) if self._active else ""
 
     def _can_write(self) -> bool:
-        return bool(self._active and self._write_enabled and self._client)
+        return bool(self._active and self._write_enabled and self._hooks_enabled and self._client)
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        if not self._active or not self._auto_recall or not self._client or not query.strip():
+        if not self._active or not self._hooks_enabled or not self._auto_recall or not self._client or not query.strip():
             return ""
         # Profile and search run in parallel, each bounded by api_timeout; either one failing leaves the other.
         jobs = {"search": lambda: self._client.search_memories(query, limit=self._max_recall_results, timeout=self._api_timeout)}

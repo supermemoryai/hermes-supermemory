@@ -218,6 +218,46 @@ def test_non_primary_contexts_never_write(api, tmp_path):
     assert api.writes() == []
 
 
+def run_session(provider):
+    provider.prefetch("Book the usual table")
+    provider.sync_turn("Book the usual table", "Booked.", messages=transcript(("Book the usual table", "Booked.")))
+    provider.on_memory_write("add", "user", "likes tea")
+    provider.on_session_end(transcript(("Book the usual table", "Booked.")))
+    provider.shutdown()
+
+
+@pytest.mark.parametrize("context", ["subagent", "flush", "cron"])
+def test_subagents_helpers_and_cron_make_no_calls(api, tmp_path, context):
+    run_session(make_provider(tmp_path, agent_context=context))
+    assert api.requests == []
+    assert json.loads(make_provider(tmp_path, agent_context=context).handle_tool_call("supermemory_search", {"query": "x"}))["count"] == 1
+
+
+def test_one_shot_runs_make_no_calls(api, tmp_path, monkeypatch):
+    monkeypatch.setattr(sm, "_host_headless", lambda: True)
+    run_session(make_provider(tmp_path, agent_context="primary"))
+    assert api.requests == []
+
+
+@pytest.mark.parametrize("context,flag", [("subagent", "captureSubagents"), ("flush", "captureSubagents"), ("cron", "captureHeadless")])
+def test_opt_in_restores_recall_for_non_primary_contexts(api, tmp_path, monkeypatch, context, flag):
+    (tmp_path / "supermemory.json").write_text(json.dumps({flag: True}))
+    run_session(make_provider(tmp_path, agent_context=context))
+    assert sorted(r["path"] for r in api.requests) == ["/ns/hermes/profile", "/ns/hermes/search"] and api.writes() == []
+
+
+@pytest.mark.parametrize("opt_in", ["config", "env"])
+def test_opt_in_restores_one_shot_recall_and_capture(api, tmp_path, monkeypatch, opt_in):
+    monkeypatch.setattr(sm, "_host_headless", lambda: True)
+    if opt_in == "env":
+        monkeypatch.setenv("SUPERMEMORY_CAPTURE_HEADLESS", "true")
+    else:
+        (tmp_path / "supermemory.json").write_text(json.dumps({"captureHeadless": True}))
+    run_session(make_provider(tmp_path, agent_context="primary"))
+    assert {r["path"] for r in api.requests} >= {"/ns/hermes/profile", "/ns/hermes/search"}
+    assert api.captures() == {"hermes_session-1": TURN1}
+
+
 def test_recall_is_full_profile_plus_search(api, tmp_path):
     text = make_provider(tmp_path).prefetch("Book the usual table")
     assert text.startswith("<supermemory-context>\n") and text.endswith("\n</supermemory-context>")
