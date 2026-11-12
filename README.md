@@ -61,8 +61,8 @@ Config file: `$HERMES_HOME/supermemory.json`
 | `entity_context` | built-in default | Extraction guidance passed to Supermemory |
 | `dreaming` | `dynamic` | `dynamic` groups related conversations before forming memories; `instant` processes each one right away (billed as one extra operation) |
 | `api_timeout` | `5.0` | Timeout for SDK requests |
-| `captureSubagents` | `false` | Recall in subagent and helper sessions (`delegate_task` children, curator, batch runs). See [Subagents, cron and one-shot runs](#subagents-cron-and-one-shot-runs) |
-| `captureHeadless` | `false` | Recall and capture in cron jobs and one-shot runs (`hermes -z`, `hermes chat -q` off a terminal) |
+| `capture_subagents` | `false` | Recall in subagent and helper sessions (`delegate_task` children, curator, batch runs). `captureSubagents` is accepted too. See [Subagents, cron and one-shot runs](#subagents-cron-and-one-shot-runs) |
+| `capture_headless` | `false` | Recall and capture in cron jobs and one-shot runs (`hermes -z`, `--oneshot`, `-Q`, stream-json, `hermes chat -q` off a terminal). `captureHeadless` is accepted too |
 
 ### Upgrading from 1.0.1
 
@@ -77,8 +77,8 @@ To keep those memories, either set the old name in `supermemory.json` (`"contain
 | `SUPERMEMORY_API_KEY` | API key (required) |
 | `SUPERMEMORY_BASE_URL` | Compatibility fallback for the API endpoint when `base_url` is not configured |
 | `SUPERMEMORY_CONTAINER_TAG` | Override the container tag / namespace (takes priority over config file) |
-| `SUPERMEMORY_CAPTURE_SUBAGENTS` | `true` / `false`; overrides `captureSubagents` |
-| `SUPERMEMORY_CAPTURE_HEADLESS` | `true` / `false`; overrides `captureHeadless` |
+| `SUPERMEMORY_CAPTURE_SUBAGENTS` | `true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off`; overrides `capture_subagents` either way |
+| `SUPERMEMORY_CAPTURE_HEADLESS` | `true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off`; overrides `capture_headless` either way |
 
 Base URL precedence is `supermemory.json` → `SUPERMEMORY_BASE_URL` →
 `https://api.supermemory.ai`. Hermes resolves it once and uses the same endpoint
@@ -122,13 +122,13 @@ Hermes tells the provider what kind of session it is. By default the plugin make
 
 - subagent and helper sessions, which Hermes starts with `agent_context` `subagent` or `flush`: `delegate_task` children, the curator, batch runs
 - cron jobs (`agent_context: cron`)
-- one-shot runs, which Hermes marks as such: `hermes -z`, `hermes chat -q` / `--oneshot` / `-Q` without a terminal, which is how scripts and CI usually start workers
+- one-shot runs, which Hermes marks as such: `hermes -z`, `--oneshot`, `-Q` and stream-json runs always, and `hermes chat -q` when stdin or stdout is not a terminal (on a terminal `-q` seeds an interactive session), which is how scripts and CI usually start workers. A finite turn submitted to an existing gateway session is skipped for that turn only; later interactive turns in the session recall and capture as usual
 
 Title generation, compression summaries and background review are plain model calls or run without a memory provider, so they never reach the plugin.
 
 The explicit `supermemory-*` tools keep working in every session.
 
-To get the previous behaviour back, set `captureSubagents` or `captureHeadless` to `true` in `supermemory.json`, or `SUPERMEMORY_CAPTURE_SUBAGENTS=true` / `SUPERMEMORY_CAPTURE_HEADLESS=true` in `$HERMES_HOME/.env` (the environment wins over the file). Subagents, helpers and cron jobs then recall again; as before, they never write, because Hermes asks providers not to write from them. One-shot runs recall and capture again.
+To get the previous behaviour back, set `capture_subagents` or `capture_headless` to `true` in `supermemory.json`, or `SUPERMEMORY_CAPTURE_SUBAGENTS=true` / `SUPERMEMORY_CAPTURE_HEADLESS=true` in `$HERMES_HOME/.env` (the environment wins over the file in both directions). Subagents, helpers and cron jobs then recall again; as before, they never write, because Hermes asks providers not to write from them. One-shot runs recall and capture again.
 
 
 ## Profile-Scoped Containers
