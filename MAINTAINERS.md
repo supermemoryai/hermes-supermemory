@@ -40,6 +40,8 @@ Dependencies in `pyproject.toml` are installed into the Hermes venv automaticall
   hook if they move.
 - Tests live in `tests/` and need Hermes Agent importable (install it and this plugin's dependencies into one venv):
   `pip install -e <hermes-agent checkout> 'supermemory>=5.0.0,<6' pytest && python -m pytest tests`. Run them on Python 3.14: Hermes pins its core dependencies only there.
+- `auth.py` (OAuth sign-in) is also run directly by the Supermemory CLI with the system `python3`
+  (`auth.py login --print-url`), so keep it standard-library only and Python 3.9 compatible.
 - While the in-tree copy still exists, a same-named user plugin is shadowed by it
   (bundled providers win on name). It takes effect the moment core drops `plugins/memory/supermemory`.
 
