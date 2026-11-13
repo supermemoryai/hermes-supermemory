@@ -258,6 +258,34 @@ def test_opt_in_restores_one_shot_recall_and_capture(api, tmp_path, monkeypatch,
     assert api.captures() == {"hermes_session-1": TURN1}
 
 
+def test_finite_turn_is_read_per_call_not_frozen_at_init(api, tmp_path, monkeypatch):
+    finite = {"on": True}
+    monkeypatch.setattr(sm, "_finite_turn", lambda: finite["on"])
+    provider = make_provider(tmp_path, agent_context="primary")
+    assert provider.prefetch("Book the usual table") == "" and api.requests == []
+    finite["on"] = False
+    assert provider.prefetch("Book the usual table")
+    provider.sync_turn("Book the usual table", "Booked.", messages=transcript(("Book the usual table", "Booked.")))
+    assert api.captures() == {"hermes_session-1": TURN1}
+
+
+@pytest.mark.parametrize("key", ["capture_headless", "captureHeadless"])
+def test_headless_flag_accepts_snake_and_camel_case(api, tmp_path, monkeypatch, key):
+    monkeypatch.setattr(sm, "_host_headless", lambda: True)
+    (tmp_path / "supermemory.json").write_text(json.dumps({key: True}))
+    run_session(make_provider(tmp_path, agent_context="primary"))
+    assert api.captures() == {"hermes_session-1": TURN1}
+
+
+@pytest.mark.parametrize("value,expected", [("1", True), ("YES", True), ("on", True), ("0", False), ("Off", False), ("no", False)])
+def test_env_flag_words_win_over_config_both_ways(api, tmp_path, monkeypatch, value, expected):
+    monkeypatch.setattr(sm, "_host_headless", lambda: True)
+    monkeypatch.setenv("SUPERMEMORY_CAPTURE_HEADLESS", value)
+    (tmp_path / "supermemory.json").write_text(json.dumps({"capture_headless": not expected}))
+    run_session(make_provider(tmp_path, agent_context="primary"))
+    assert bool(api.requests) is expected
+
+
 def test_recall_is_full_profile_plus_search(api, tmp_path):
     text = make_provider(tmp_path).prefetch("Book the usual table")
     assert text.startswith("<supermemory-context>\n") and text.endswith("\n</supermemory-context>")
