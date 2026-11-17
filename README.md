@@ -131,9 +131,10 @@ Supermemory app, so you can filter, browse, and bulk-manage them per source agen
 When enabled, Hermes can:
 
 - before each turn, recall relevant memories, plus profile facts on the first turn and every `profile_frequency` turns
-- after each completed turn, save the conversation so far as **one document per conversation**, rewritten in full, so undo, edits and context compaction never store it twice
-- skip a save when nothing changed, and retry a failed one later (up to 50 conversations); a failed save is logged and never breaks the turn
-- store messages as given (only the plugin's own recalled `<supermemory-context>` block and inline base64 images are left out)
+- on Supermemory cloud, after each completed turn, send the conversation's messages added since the last accepted send, tool calls included, to **one document per conversation**; Supermemory keeps the user and assistant text as the document. Progress is saved per conversation in `$HERMES_HOME/supermemory_sessions/` and only moves once a send is accepted, so a failed send is logged, never breaks the turn, and is sent again with the next turn or when the session ends. Undo and context compaction resend the rewritten conversation
+- on a self-hosted or custom endpoint, after each completed turn, save the conversation so far as **one document per conversation**, rewritten in full, so undo, edits and context compaction never store it twice
+- there, skip a save when nothing changed, and retry a failed one later (up to 50 conversations); a failed save is logged and never breaks the turn
+- there, store messages as given (only the plugin's own recalled `<supermemory-context>` block and inline base64 images are left out)
 - copy built-in `memory` tool additions into Supermemory
 - route every SDK and probe request through the configured hosted or self-hosted endpoint
 - expose explicit tools for search, store, forget, profile, and reading documents

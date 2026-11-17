@@ -107,6 +107,11 @@ def api(monkeypatch, tmp_path):
     return fake
 
 
+@pytest.fixture
+def self_hosted(monkeypatch):
+    monkeypatch.setenv("SUPERMEMORY_BASE_URL", "http://localhost:6767")
+
+
 def make_provider(home, session_id="session-1", **kwargs):
     provider = SupermemoryMemoryProvider()
     provider.initialize(session_id, hermes_home=str(home), platform="cli", **kwargs)
@@ -122,6 +127,10 @@ def transcript(*turns):
                      {"role": "tool", "tool_call_id": "c", "content": "ok"},
                      {"role": "assistant", "content": reply}]
     return messages
+
+
+def records(messages):
+    return "".join(json.dumps(m, separators=(",", ":")) + "\n" for m in messages)
 
 
 TURN1 = "[role: user]\nBook the usual table\n[user:end]\n[role: assistant]\nBooked.\n[assistant:end]"
@@ -186,7 +195,7 @@ def test_config_file_and_normalization(tmp_path):
     assert sm._load_supermemory_config(None)["profile_frequency"] == 50
 
 
-def test_each_turn_rewrites_one_growing_document(api, tmp_path):
+def test_each_turn_rewrites_one_growing_document(api, self_hosted, tmp_path):
     provider = make_provider(tmp_path)
     first = transcript(("Book the usual table", "Booked."))
     provider.sync_turn("Book the usual table", "Booked.", messages=first)
@@ -204,26 +213,27 @@ def test_each_turn_rewrites_one_growing_document(api, tmp_path):
     assert body["metadata"] == {"sm_source": "hermes", "type": "conversation", "session_id": "session-1",
                                 "docId": "hermes_session-1"}
     assert body["supportingContext"] == sm._DEFAULT_ENTITY_CONTEXT and body["dreaming"] == "dynamic"
+    assert "x-sm-session" not in writes[1]["headers"]
     assert datetime.fromisoformat(body["date"]).tzinfo is not None  # the write time
     assert writes[2]["body"]["content"] == TURN1 + "\n\n" + TURN2 and "id" not in writes[2]["body"]
     assert api.captures() == {"hermes_session-1": TURN1 + "\n\n" + TURN2}
 
 
-def test_content_is_stored_as_given(api, tmp_path):
+def test_content_is_stored_as_given(api, self_hosted, tmp_path):
     provider = make_provider(tmp_path)
     user = "[Tue 2026-04-28 13:40:53 CEST] Book the usual table"
     provider.sync_turn(user, "Booked.", messages=transcript((user, "Booked.")))
     assert api.writes()[0]["body"]["content"].startswith(f"[role: user]\n{user}\n")
 
 
-def test_turn_still_in_progress_is_left_out(api, tmp_path):
+def test_turn_still_in_progress_is_left_out(api, self_hosted, tmp_path):
     provider = make_provider(tmp_path)
     running_ahead = transcript(("Book the usual table", "Booked.")) + [{"role": "user", "content": "Next"}]
     provider.sync_turn("Book the usual table", "Booked.", messages=running_ahead)
     assert api.writes()[-1]["body"]["content"] == TURN1
 
 
-def test_refused_write_is_logged_not_raised_and_retried(api, tmp_path, caplog):
+def test_refused_write_is_logged_not_raised_and_retried(api, self_hosted, tmp_path, caplog):
     provider = make_provider(tmp_path)
     api.failures = [("/document", 405)]
     messages = transcript(("Book the usual table", "Booked."))
@@ -233,7 +243,7 @@ def test_refused_write_is_logged_not_raised_and_retried(api, tmp_path, caplog):
     assert api.captures() == {"hermes_session-1": TURN1}
 
 
-def test_new_provider_per_turn_keeps_one_document(api, tmp_path):
+def test_new_provider_per_turn_keeps_one_document(api, self_hosted, tmp_path):
     # Hermes' gateway builds a new provider for every turn of a session and hands it the whole transcript.
     first = transcript(("Book the usual table", "Booked."))
     second = first + transcript(("And a cab at 7.", "Cab booked."))
@@ -245,7 +255,7 @@ def test_new_provider_per_turn_keeps_one_document(api, tmp_path):
     assert api.captures() == {"hermes_local-ab12": TURN1 + "\n\n" + TURN2}
 
 
-def test_session_reset_starts_a_new_document(api, tmp_path):
+def test_session_reset_starts_a_new_document(api, self_hosted, tmp_path):
     provider = make_provider(tmp_path)
     provider.sync_turn("Book the usual table", "Booked.", messages=transcript(("Book the usual table", "Booked.")))
     provider.on_session_switch("session-2", reset=True)
@@ -374,11 +384,11 @@ def test_memory_manager_dispatch(api, tmp_path):
     manager.add_provider(make_provider(tmp_path))
     extra = ({"turn_author": {"id": "u1", "name": "Morgan", "is_bot": False}}
              if "turn_author" in inspect.signature(manager.sync_all).parameters else {})
-    manager.sync_all("Book the usual table", "Booked.", session_id="session-1",
-                     messages=transcript(("Book the usual table", "Booked.")), **extra)
+    messages = transcript(("Book the usual table", "Booked."))
+    manager.sync_all("Book the usual table", "Booked.", session_id="session-1", messages=messages, **extra)
     manager.flush_pending(timeout=10)
     manager.shutdown_all()
-    assert api.captures() == {"hermes_session-1": TURN1}
+    assert api.captures() == {"hermes_session-1": records(messages)}
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits not enforced on Windows")
@@ -394,7 +404,7 @@ SUMMARY = ("[CONTEXT COMPACTION — REFERENCE ONLY] The user booked a table.\n\n
            "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---")
 
 
-def test_rewind_and_edit_rewrite_the_document(api, tmp_path):
+def test_rewind_and_edit_rewrite_the_document(api, self_hosted, tmp_path):
     provider = make_provider(tmp_path)
     both = transcript(("Book the usual table", "Booked."), ("And a cab at 7.", "Cab booked."))
     provider.sync_turn("And a cab at 7.", "Cab booked.", messages=both)
@@ -409,7 +419,7 @@ def test_rewind_and_edit_rewrite_the_document(api, tmp_path):
 
 
 @pytest.mark.parametrize("new_provider", [False, True], ids=["same-provider", "provider-per-turn"])
-def test_compaction_keeps_one_copy(api, tmp_path, new_provider):
+def test_compaction_keeps_one_copy(api, self_hosted, tmp_path, new_provider):
     provider = make_provider(tmp_path)
     before = transcript(("Book the usual table", "Booked."), ("And a cab at 7.", "Cab booked."))
     provider.sync_turn("And a cab at 7.", "Cab booked.", messages=before)
@@ -422,7 +432,7 @@ def test_compaction_keeps_one_copy(api, tmp_path, new_provider):
     assert api.captures() == {"hermes_session-1": "\n\n".join((TURN1, TURN2, TURN3))}
 
 
-def test_compaction_into_a_child_session_keeps_writing_the_same_document(api, tmp_path):
+def test_compaction_into_a_child_session_keeps_writing_the_same_document(api, self_hosted, tmp_path):
     provider = make_provider(tmp_path)
     before = transcript(("Book the usual table", "Booked."), ("And a cab at 7.", "Cab booked."))
     provider.sync_turn("And a cab at 7.", "Cab booked.", messages=before)
@@ -441,7 +451,7 @@ def test_summary_merged_into_a_kept_message_is_left_out():
     assert turns == [{"user": "And a cab at 7.", "assistant": "Cab booked."}]
 
 
-def test_resend_after_a_lost_response_keeps_one_copy(api, tmp_path):
+def test_resend_after_a_lost_response_keeps_one_copy(api, self_hosted, tmp_path):
     provider = make_provider(tmp_path)
     first = transcript(("Book the usual table", "Booked."))
     api.lose = [True]
@@ -454,7 +464,7 @@ def test_resend_after_a_lost_response_keeps_one_copy(api, tmp_path):
 
 
 # 1.0.x appended turn 1 to its 4-hour window document; the session goes on under 2.0.
-def test_upgraded_session_continues_without_storing_turns_twice(api, tmp_path):
+def test_upgraded_session_continues_without_storing_turns_twice(api, self_hosted, tmp_path):
     api.docs["session-1_2026-10-20_b2"] = {"id": "session-1_2026-10-20_b2", "content": TURN1,
                                            "metadata": {"sm_source": "hermes", "type": "conversation", "session_id": "session-1"}}
     messages = transcript(("Book the usual table", "Booked."), ("And a cab at 7.", "Cab booked."))
@@ -464,7 +474,7 @@ def test_upgraded_session_continues_without_storing_turns_twice(api, tmp_path):
     assert listed["body"]["filter"] == {"field": "session_id", "operator": "eq", "value": "session-1"}
 
 
-def test_upgrade_lookup_failure_heals_on_the_next_write(api, tmp_path):
+def test_upgrade_lookup_failure_heals_on_the_next_write(api, self_hosted, tmp_path):
     api.docs["session-1_2026-10-20_b2"] = {"id": "session-1_2026-10-20_b2", "content": TURN1,
                                            "metadata": {"type": "conversation", "session_id": "session-1"}}
     api.failures = [("/list/documents", 503)]
@@ -476,7 +486,7 @@ def test_upgrade_lookup_failure_heals_on_the_next_write(api, tmp_path):
     assert api.captures()["hermes_session-1"] == TURN2 + "\n\n" + TURN3
 
 
-def test_failed_documents_of_past_sessions_are_retried_and_bounded(api, tmp_path, monkeypatch, caplog):
+def test_failed_documents_of_past_sessions_are_retried_and_bounded(api, self_hosted, tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(sm, "_MAX_PENDING_DOCS", 2)
     provider = make_provider(tmp_path, session_id="s0")
     api.failures = [("/document", 503)] * 100
@@ -544,7 +554,7 @@ def test_setup_reads_the_key_through_hermes_and_leaves_the_environment_alone(api
     assert "os.environ" not in inspect.getsource(sm)
 
 
-def test_compaction_keeping_head_and_tail_stores_each_turn_once(api, tmp_path):
+def test_compaction_keeping_head_and_tail_stores_each_turn_once(api, self_hosted, tmp_path):
     provider = make_provider(tmp_path)
     three = transcript(("Book the usual table", "Booked."), ("And a cab at 7.", "Cab booked."), ("Make it 8 instead.", "Moved to 8."))
     provider.sync_turn("Make it 8 instead.", "Moved to 8.", messages=three)
@@ -557,7 +567,7 @@ def test_compaction_keeping_head_and_tail_stores_each_turn_once(api, tmp_path):
     assert api.captures() == {"hermes_session-1": "\n\n".join((TURN1, TURN2, TURN3, turn4))}
 
 
-def test_failed_document_read_after_compaction_defers_the_write(api, tmp_path):
+def test_failed_document_read_after_compaction_defers_the_write(api, self_hosted, tmp_path):
     make_provider(tmp_path).sync_turn("And a cab at 7.", "Cab booked.", messages=transcript(
         ("Book the usual table", "Booked."), ("And a cab at 7.", "Cab booked.")))
     compacted = [{"role": "user", "content": SUMMARY, "_compressed_summary": True}] + transcript(
@@ -570,7 +580,7 @@ def test_failed_document_read_after_compaction_defers_the_write(api, tmp_path):
     assert api.captures() == {"hermes_session-1": "\n\n".join((TURN1, TURN2, TURN3))}
 
 
-def test_undo_after_a_failed_write_rewrites_the_shorter_snapshot(api, tmp_path):
+def test_undo_after_a_failed_write_rewrites_the_shorter_snapshot(api, self_hosted, tmp_path):
     provider = make_provider(tmp_path)
     first = transcript(("Book the usual table", "Booked."))
     provider.sync_turn("Book the usual table", "Booked.", messages=first)
@@ -581,3 +591,99 @@ def test_undo_after_a_failed_write_rewrites_the_shorter_snapshot(api, tmp_path):
     provider.on_session_switch("session-2", reset=True)
     provider.shutdown()
     assert api.captures() == {"hermes_session-1": TURN1} and provider._pending == {}
+
+
+def test_each_turn_sends_only_the_new_messages(api, tmp_path):
+    provider = make_provider(tmp_path)
+    first = transcript(("Book the usual table", "Booked."))
+    provider.sync_turn("Book the usual table", "Booked.", messages=first)
+    second = first + transcript(("And a cab at 7.", "Cab booked."))
+    provider.sync_turn("And a cab at 7.", "Cab booked.", messages=second)
+    provider.on_session_end(second)
+    provider.shutdown()
+    writes = api.writes()
+    assert [(w["method"], w["path"], w["headers"]["x-sm-session"], w["headers"]["x-sm-source"]) for w in writes] == [
+        ("POST", "/ns/hermes/document", "hermes", "hermes")] * 2
+    assert [w["body"]["content"] for w in writes] == [records(first), records(second[4:])]
+    body = writes[1]["body"]
+    assert body["id"] == "hermes_session-1" and body["dreaming"] == "dynamic"
+    assert body["supportingContext"] == sm._DEFAULT_ENTITY_CONTEXT and writes[1]["headers"]["authorization"] == "Bearer test-key"
+    assert body["metadata"] == {"sm_source": "hermes", "type": "conversation", "session_id": "session-1",
+                                "docId": "hermes_session-1", "sm_session_generation": 0, "sm_session_offset": 4}
+    assert writes[0]["body"]["metadata"]["sm_session_offset"] == 0
+
+
+def test_a_send_that_is_not_accepted_is_resent(api, tmp_path):
+    provider = make_provider(tmp_path)
+    first = transcript(("Book the usual table", "Booked."))
+    api.failures = [("/document", 503)]
+    provider.sync_turn("Book the usual table", "Booked.", messages=first)
+    assert not (tmp_path / "supermemory_sessions").exists()
+    second = first + transcript(("And a cab at 7.", "Cab booked."))
+    api.lose = [True]
+    provider.sync_turn("And a cab at 7.", "Cab booked.", messages=second)
+    provider.shutdown()
+    sent = [(w["body"]["metadata"]["sm_session_offset"], w["body"]["content"]) for w in api.writes()]
+    assert sent == [(0, records(first)), (0, records(second)), (0, records(second))]
+    (cursor,) = (tmp_path / "supermemory_sessions").iterdir()
+    assert cursor.name == "hermes_session-1.json"
+    saved = json.loads(cursor.read_text())
+    assert (saved["generation"], saved["offset"]) == (0, 8)
+
+
+def test_a_new_provider_continues_from_the_saved_cursor(api, tmp_path):
+    first = transcript(("Book the usual table", "Booked.\n"))
+    make_provider(tmp_path, session_id="local-ab12").sync_turn("Book the usual table", "Booked.", session_id="local-ab12",
+                                                               messages=first)
+    reloaded = [{**m, "message_uid": f"u{i}", "_db_persisted": True} for i, m in enumerate(first)]
+    reloaded[2]["content"], reloaded[3]["content"] = "[pruned]", "Booked."
+    second = reloaded + transcript(("And a cab at 7.", "Cab booked."))
+    make_provider(tmp_path, session_id="local-ab12").sync_turn("And a cab at 7.", "Cab booked.", session_id="local-ab12",
+                                                               messages=second)
+    writes = api.writes()
+    assert [w["body"]["content"] for w in writes] == [records(first), records(second[4:])]
+    assert [w["body"]["metadata"]["sm_session_generation"] for w in writes] == [0, 0]
+
+
+def test_a_rewritten_transcript_starts_a_new_generation(api, tmp_path):
+    provider = make_provider(tmp_path)
+    before = transcript(("Book the usual table", "Booked."), ("And a cab at 7.", "Cab booked."))
+    provider.sync_turn("And a cab at 7.", "Cab booked.", messages=before)
+    provider.on_session_switch("session-1-c1", parent_session_id="session-1", reason="compression")
+    compacted = [{"role": "user", "content": SUMMARY, "_compressed_summary": True}] + transcript(
+        ("And a cab at 7.", "Cab booked."), ("Make it 8 instead.", "Moved to 8."))
+    provider.sync_turn("Make it 8 instead.", "Moved to 8.", session_id="session-1-c1", messages=compacted)
+    provider.on_session_switch("session-1-c1", rewound=True)
+    provider.sync_turn("And a cab at 7.", "Cab booked.", session_id="session-1-c1", messages=compacted[:5])
+    writes = api.writes()
+    assert {w["body"]["id"] for w in writes} == {"hermes_session-1"}
+    assert [(w["body"]["metadata"]["sm_session_generation"], w["body"]["metadata"]["sm_session_offset"]) for w in writes] == [
+        (0, 0), (1, 0), (2, 0)]
+    assert [w["body"]["content"] for w in writes] == [records(before), records(compacted), records(compacted[:5])]
+
+
+def test_a_turn_still_in_progress_waits_for_the_session_end(api, tmp_path):
+    provider = make_provider(tmp_path)
+    running_ahead = transcript(("Book the usual table", "Booked.")) + [{"role": "user", "content": "Next"}]
+    provider.sync_turn("Book the usual table", "Booked.", messages=running_ahead)
+    provider.on_session_end(running_ahead)
+    sent = [(w["body"]["metadata"]["sm_session_offset"], w["body"]["content"]) for w in api.writes()]
+    assert sent == [(0, records(running_ahead[:4])), (4, records(running_ahead[4:]))]
+
+
+def test_session_capture_uses_the_oauth_sign_in(api, issuer, monkeypatch, tmp_path):
+    monkeypatch.delenv("SUPERMEMORY_API_KEY")
+    save_sign_in()
+    make_provider(tmp_path).sync_turn("Book the usual table", "Booked.", messages=transcript(("Book the usual table", "Booked.")))
+    (write,) = api.writes()
+    assert write["headers"]["authorization"] == "Bearer access-0" and write["headers"]["x-sm-session"] == "hermes"
+
+
+def test_auto_capture_off_sends_no_session(api, tmp_path):
+    (tmp_path / "supermemory.json").write_text(json.dumps({"auto_capture": False}))
+    provider = make_provider(tmp_path)
+    messages = transcript(("Book the usual table", "Booked."))
+    provider.sync_turn("Book the usual table", "Booked.", messages=messages)
+    provider.on_session_end(messages)
+    provider.shutdown()
+    assert api.writes() == []
