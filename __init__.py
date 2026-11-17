@@ -40,6 +40,8 @@ _API_KEY_URL = "https://console.supermemory.ai/keys?create=true"
 # Strips injected <supermemory-context> / <supermemory-containers> blocks before capture.
 _INJECTED_BLOCK_RE = re.compile(r"<supermemory-(context|containers)>[\s\S]*?</supermemory-\1>\s*", re.DOTALL)
 _DATA_URI_RE = re.compile(r"data:[^;,\s]+;base64,[A-Za-z0-9+/=]+")  # pasted inline images are useless as memory text
+_MEMORY_CONTEXT_RE = re.compile(r"<\s*memory-context\s*>[\s\S]*?</\s*memory-context\s*>", re.IGNORECASE)
+_SESSION_CURSOR_DIR = "supermemory_sessions"
 _READ_WINDOW_CHARS = 8000
 _MAX_PENDING_DOCS = 50
 _MAX_PENDING_BYTES = 256 * 1024
@@ -250,6 +252,12 @@ class _SupermemoryClient:
             merged["type"] = str(legacy_source)
         return merged
 
+    def _document_kwargs(self, content: str, metadata: dict, entity_context: str, dreaming: str) -> dict:
+        return {"content": content, "date": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "metadata": self._merge_metadata(metadata),
+                **({"supporting_context": _clamp_entity_context(entity_context)} if entity_context else {}),
+                **({"dreaming": dreaming} if dreaming else {})}
+
     def add_memory(self, content: str, metadata: Optional[dict] = None, *, entity_context: str = "",
                    container_tag: Optional[str] = None, dreaming: str = "") -> dict:
         kwargs: dict[str, Any] = {"content": content.strip(), "date": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -260,14 +268,15 @@ class _SupermemoryClient:
 
     # PATCH replaces the whole document, so a resend, rewind or edit never appends it to itself; the first write creates it.
     def write_document(self, doc_id: str, content: str, metadata: dict, *, entity_context: str = "", dreaming: str = "") -> None:
-        kwargs: dict[str, Any] = {"content": content.strip(), "date": datetime.now().astimezone().isoformat(timespec="seconds"),
-                                  "metadata": self._merge_metadata(metadata),
-                                  **({"supporting_context": _clamp_entity_context(entity_context)} if entity_context else {}),
-                                  **({"dreaming": dreaming} if dreaming else {})}
+        kwargs = self._document_kwargs(content.strip(), metadata, entity_context, dreaming)
         try:
             self._client.documents.update(self._container_tag, urllib.parse.quote(doc_id, safe=""), **kwargs)
         except self._sm.NotFoundError:
             self._client.add(self._container_tag, id=doc_id, **kwargs)
+
+    def add_session(self, doc_id: str, raw: str, metadata: dict, *, entity_context: str = "", dreaming: str = "") -> None:
+        self._client.add(self._container_tag, id=doc_id, extra_headers={"x-sm-session": "hermes"},
+                         **self._document_kwargs(raw, metadata, entity_context, dreaming))
 
     # 1.0.x wrote a session as appended deltas in one document per 4-hour window, stamped with its session_id and no docId.
     def legacy_capture_text(self, session_id: str) -> str:
@@ -393,6 +402,34 @@ def _join_turns(archive: List[Dict[str, str]], turns: List[Dict[str, str]]) -> L
     rest, room = turns[head:], len(archive) - head
     tail = next((k for k in range(min(room, len(rest)), 0, -1) if archive[-k:] == rest[:k]), 0)
     return archive + rest[tail:]
+
+
+def _through_last_reply(messages: list) -> list:
+    last_user = max((i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "user"), default=-1)
+    replied = any(isinstance(m, dict) and m.get("role") == "assistant" and _clean_text_for_capture(_message_text(m.get("content")))
+                  for m in messages[last_user + 1:])
+    return messages if last_user < 0 or replied else messages[:last_user]
+
+
+def _session_record(message: Any) -> str:
+    return json.dumps(message, separators=(",", ":"), default=str) + "\n"
+
+
+def _session_identity(message: Any) -> list:
+    message = message if isinstance(message, dict) else {}
+    text = "" if message.get("role") == "tool" else _MEMORY_CONTEXT_RE.sub("", _message_text(message.get("content"))).strip()
+    return [message.get("role"), message.get("tool_call_id"),
+            [call.get("id") for call in message.get("tool_calls") or [] if isinstance(call, dict)], text]
+
+
+def _session_digest(messages: list) -> str:
+    return hashlib.sha256(json.dumps([_session_identity(m) for m in messages], default=str).encode()).hexdigest()
+
+
+def _save_cursor(path: Path, cursor: dict) -> None:
+    from utils import atomic_json_write
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json_write(path, cursor)
 
 
 def _build_client(api_key: str, config: dict, container_tag: str, oauth: Optional[dict] = None) -> _SupermemoryClient:
@@ -621,6 +658,33 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._captured_digest: Optional[str] = None
         self._unsent: Optional[dict] = None
         self._legacy_text: Optional[str] = None
+        self._raw_messages: Optional[list] = None
+
+    def _sends_raw_sessions(self) -> bool:
+        return self._base_url == _DEFAULT_BASE_URL
+
+    def _cursor_path(self) -> Path:
+        return Path(self._hermes_home) / _SESSION_CURSOR_DIR / f"{urllib.parse.quote(self._doc_id, safe='')}.json"
+
+    def _capture_raw(self, mode: str, messages: list) -> None:
+        with self._capture_lock:
+            self._raw_messages = messages = list(messages)
+            path = self._cursor_path()
+            cursor = _read_json_dict(path)
+            generation, offset = (_clamp_number(cursor.get(key), 0, 0, 10**9, int) for key in ("generation", "offset"))
+            if offset > len(messages) or (offset and cursor.get("digest") != _session_digest(messages[:offset])):
+                generation, offset = generation + 1, 0
+            if offset >= len(messages):
+                return
+            raw = "".join(_session_record(m) for m in messages[offset:])
+            metadata = {"type": "conversation", "session_id": self._doc_session, "docId": self._doc_id,
+                        "sm_session_generation": generation, "sm_session_offset": offset}
+            if _quietly(lambda: self._client.add_session(self._doc_id, raw, metadata, entity_context=self._entity_context,
+                                                         dreaming=self._dreaming) or True,
+                        "Supermemory capture failed (%s, document %s)", mode, self._doc_id, level=logging.WARNING, default=False):
+                _quietly(lambda: _save_cursor(path, {"generation": generation, "offset": len(messages),
+                                                     "digest": _session_digest(messages)}),
+                         "Failed to write %s", path, level=logging.WARNING)
 
     def _write(self, doc_id: str, doc: dict, mode: str) -> bool:
         return _quietly(lambda: self._client.write_document(doc_id, doc["content"], doc["metadata"], entity_context=self._entity_context,
@@ -701,6 +765,9 @@ class SupermemoryMemoryProvider(MemoryProvider):
             return
         if session_id and session_id != self._session_id:
             self.on_session_switch(session_id)
+        if messages is not None and self._sends_raw_sessions():
+            self._capture_raw("turn", _through_last_reply(messages))
+            return
         turn = {"user": _clean_text_for_capture(_message_text(user_content)),
                 "assistant": _clean_text_for_capture(_message_text(assistant_content))}
         if messages is None and turn["user"]:
@@ -708,7 +775,11 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._capture("turn", messages, completed_only=True)
 
     def _flush(self, mode: str, messages: Optional[list] = None) -> None:
-        if self._can_write() and self._auto_capture:
+        if not (self._can_write() and self._auto_capture):
+            return
+        if (raw := messages or self._raw_messages) is not None and self._sends_raw_sessions():
+            self._capture_raw(mode, raw)
+        else:
             self._capture(mode, messages)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
