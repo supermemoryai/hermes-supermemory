@@ -580,7 +580,7 @@ def test_status_reads_the_key_through_hermes_and_leaves_the_environment_alone(ap
     assert "os.environ" not in inspect.getsource(sm)
 
 
-def test_setup_reads_the_key_through_hermes_and_defaults_new_setups_to_the_user_scope(api, tmp_path, monkeypatch):
+def test_setup_reads_the_key_through_hermes_and_leaves_the_environment_alone(api, tmp_path, monkeypatch):
     import hermes_cli.config
     import hermes_cli.memory_setup
 
@@ -592,10 +592,18 @@ def test_setup_reads_the_key_through_hermes_and_defaults_new_setups_to_the_user_
     SupermemoryMemoryProvider().post_setup(str(tmp_path), {})
     assert "SUPERMEMORY_API_KEY" in seen and dict(os.environ) == before
     assert api.requests[-1]["headers"]["authorization"] == "Bearer scoped-key"
-    assert sm._load_supermemory_config(str(tmp_path))["memory_scope"] == "user"
-    sm._save_supermemory_config({"memory_scope": "shared"}, str(tmp_path))
+
+
+def test_a_first_setup_defaults_to_the_user_scope(api, tmp_path, monkeypatch):
+    import hermes_cli.config
+    import hermes_cli.memory_setup
+
+    monkeypatch.setattr(hermes_cli.config, "save_config", lambda config: None)
+    monkeypatch.setattr(hermes_cli.memory_setup, "_prompt", lambda *a, **k: "new-key")
+    monkeypatch.setattr(hermes_cli.memory_setup, "_write_env_vars", lambda values, hermes_home=None: None)
+    monkeypatch.setattr(sm, "get_secret", lambda name, default=None: default)
     SupermemoryMemoryProvider().post_setup(str(tmp_path), {})
-    assert sm._load_supermemory_config(str(tmp_path))["memory_scope"] == "shared"
+    assert sm._load_supermemory_config(str(tmp_path))["memory_scope"] == "user"
 
 
 def test_rerunning_setup_keeps_an_existing_bot_on_the_shared_container(api, tmp_path, monkeypatch):
@@ -609,7 +617,19 @@ def test_rerunning_setup_keeps_an_existing_bot_on_the_shared_container(api, tmp_
     SupermemoryMemoryProvider().post_setup(str(tmp_path), {})
     assert sm._load_supermemory_config(str(tmp_path))["memory_scope"] == "shared"
     (tmp_path / "supermemory.json").unlink()
-    SupermemoryMemoryProvider().post_setup(str(tmp_path), {"memory": {"provider": "supermemory"}})
+    SupermemoryMemoryProvider().post_setup(str(tmp_path), {"memory": {"provider": ""}})
+    assert sm._load_supermemory_config(str(tmp_path))["memory_scope"] == "shared"
+
+
+def test_rerunning_setup_keeps_a_signed_in_bot_on_the_shared_container(api, issuer, tmp_path, monkeypatch):
+    import hermes_cli.config
+    import hermes_cli.memory_setup
+
+    monkeypatch.setattr(hermes_cli.config, "save_config", lambda config: None)
+    monkeypatch.setattr(hermes_cli.memory_setup, "_prompt", lambda *a, **k: "")
+    monkeypatch.setattr(sm, "get_secret", lambda name, default=None: default)
+    save_sign_in()
+    SupermemoryMemoryProvider().post_setup(str(tmp_path), {"memory": {"provider": ""}})
     assert sm._load_supermemory_config(str(tmp_path))["memory_scope"] == "shared"
 
 
