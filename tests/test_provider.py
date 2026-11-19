@@ -789,10 +789,12 @@ def test_scoped_names_are_platform_qualified_and_valid(api, tmp_path):
 def test_group_chat_files_each_speaker_under_that_speaker(api, tmp_path):
     scope(tmp_path, "user")
     provider = make_provider(tmp_path, **{**GATEWAY, "chat_type": "group"})
-    for author, user, reply in (("42", "Book the usual table", "Booked."), ("7", "And a cab at 7.", "Cab booked.")):
+    turns = (("42", "Book the usual table", "Booked."), ("7", "And a cab at 7.", "Cab booked."))
+    for n, (author, user, reply) in enumerate(turns, 1):
         provider.on_turn_start(1, user, author_id=author, author_name=None, author_is_bot=False)
         provider.prefetch(user)
-        provider.sync_turn(user, reply, messages=transcript((user, reply)), turn_author={"id": author, "name": None, "is_bot": False})
+        provider.sync_turn(user, reply, messages=transcript(*((u, r) for _, u, r in turns[:n])),
+                           turn_author={"id": author, "name": None, "is_bot": False})
     provider.on_session_end([])
     searches = [r["path"] for r in api.requests if r["path"].endswith("/search")]
     assert searches == ["/ns/hermes:telegram:user:42/search", "/ns/hermes:telegram:user:7/search"]
@@ -980,12 +982,12 @@ def test_panel_schema_loads_and_saves_through_the_hermes_dashboard(tmp_path, mon
     schema = get_provider_config_schema("supermemory")
     assert schema is not None and schema.name == "supermemory" and schema.storage == "flat_json"
     payload = memory_providers._declared_provider_payload(schema)
-    assert {f["key"]: f["value"] for f in payload["fields"]}["memory_scope"] == "user"
+    assert {f["key"]: f["value"] for f in payload["fields"]}["memory_scope"] == "shared"
     monkeypatch.setattr(memory_providers, "save_env_value", lambda key, value: None)
     monkeypatch.setattr(memory_providers, "save_config", lambda config: None)
     memory_providers._update_memory_provider_config(schema, {f["key"]: f["value"] for f in payload["fields"]})
     config = sm._load_supermemory_config(str(tmp_path))
-    assert (config["memory_scope"], config["namespace"], config["threshold"]) == ("user", "hermes", None)
+    assert (config["memory_scope"], config["namespace"], config["threshold"]) == ("shared", "hermes", None)
     panel_keys = {f.key for f in schema.fields} - {"api_key"}
     assert panel_keys == set(sm._PANEL_KEYS)
 
@@ -1057,6 +1059,33 @@ def test_group_rewind_drops_stored_turns_the_transcript_no_longer_has(api, tmp_p
     group_turn(make_provider(tmp_path, **group), "42", rewound)
     turn9 = "[role: user]\nMake it 9 instead.\n[user:end]\n[role: assistant]\nMoved to 9.\n[assistant:end]"
     assert api.captures()[mine] == TURN1 + "\n\n" + turn9
+
+
+def test_group_rewind_past_a_speakers_only_turn_deletes_their_document(api, tmp_path):
+    scope(tmp_path, "user")
+    group = {**GATEWAY, "chat_type": "group"}
+    first = make_provider(tmp_path, **group)
+    full = transcript(("Book the usual table", "Booked."), ("And a cab at 7.", "Cab booked."))
+    group_turn(first, "7", full[:4])
+    group_turn(first, "42", full)
+    theirs, mine = "hermes:telegram:user:42/hermes_session-1", "hermes:telegram:user:7/hermes_session-1"
+    assert api.captures()[theirs] == TURN2
+    group_turn(first, "7", transcript(("Book the usual table", "Booked."), ("Make it 8 instead.", "Moved to 8.")))
+    assert theirs not in api.captures() and api.captures()[mine] == TURN1 + "\n\n" + TURN3
+
+
+def test_a_removal_waits_for_the_slow_add_before_it(api, tmp_path):
+    provider = make_provider(tmp_path)
+    released, add = sm.threading.Event(), provider._client.add_memory
+    provider._client.add_memory = lambda *a, **k: released.wait(5) and add(*a, **k)
+    sm.threading.Timer(2.3, released.set).start()
+    provider.on_memory_write("add", "user", "likes tea")
+    provider.on_memory_write("remove", "user", "", metadata={"previous_content": "likes tea"})
+    provider.shutdown()
+    for thread in sm.threading.enumerate():
+        if thread.name == "supermemory-memory-write":
+            thread.join(5)
+    assert not api.docs
 
 
 def test_the_panel_namespace_overrides_a_1x_container_tag(api, tmp_path):

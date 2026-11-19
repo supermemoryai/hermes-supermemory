@@ -388,6 +388,9 @@ class _SupermemoryClient:
         return {"id": doc_id, "date": doc.get("date") or (doc.get("metadata") or {}).get("date"), "content": window,
                 "next_offset": end if end < len(content) else None}
 
+    def delete_document(self, doc_id: str, *, namespace: Optional[str] = None) -> None:
+        self._client.documents.delete(namespace or self._namespace, ids=[doc_id])
+
     # V5 answers 200 with per-id errors, so a missing or ineligible id must be read from the body; returns the error or "".
     def forget_memory(self, memory_id: str, *, namespace: Optional[str] = None) -> str:
         result = _as_dict(self._client.memories.forget(namespace or self._namespace, ids=[memory_id]))
@@ -771,9 +774,11 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._turn_authors: Dict[int, tuple] = {}
         self._speakers: Dict[str, dict] = {}
 
+    # An empty document is one a rewind emptied, so it is deleted.
     def _write(self, doc_id: str, doc: dict, mode: str) -> bool:
-        return _quietly(lambda: self._client.write_document(doc_id, doc["content"], doc["metadata"], entity_context=self._entity_context,
-                                                            dreaming=self._dreaming, namespace=doc.get("namespace")) or True,
+        return _quietly(lambda: (self._client.write_document(doc_id, doc["content"], doc["metadata"], entity_context=self._entity_context,
+                                                             dreaming=self._dreaming, namespace=doc.get("namespace")) if doc["content"]
+                                 else self._client.delete_document(doc_id, namespace=doc.get("namespace"))) or True,
                         "Supermemory capture failed (%s, document %s)", mode, doc_id, level=logging.WARNING, default=False)
 
     # Documents of earlier sessions whose last write failed.
@@ -906,12 +911,13 @@ class SupermemoryMemoryProvider(MemoryProvider):
                                           else _join_turns(state["archive"], state["turns"]))
                 content = "\n\n".join(_format_turn(t["user"], t["assistant"]) for t in state["content_turns"])
                 digest = hashlib.sha256(content.encode()).hexdigest()
-                if not content or (digest == state["digest"] and state["unsent"] is None):
+                if (digest == state["digest"] and state["unsent"] is None) or (not content and not (complete and turns and (state["digest"] or state["archive"]))):
                     continue
                 doc = {"content": content, "namespace": namespace,
                        "metadata": {"type": "conversation", "session_id": self._doc_session, "docId": self._doc_id, **self._ids(speaker)}}
                 if self._write(self._doc_id, doc, mode):
                     state["digest"], state["unsent"] = digest, None
+                    state["archive"] = state["archive"] if content else []
                 else:
                     state["unsent"] = doc
 
@@ -955,8 +961,13 @@ class SupermemoryMemoryProvider(MemoryProvider):
         if self._can_write() and (forgets or add):
             self._mirror(forgets, add)
 
+    # Each mirror worker waits for the one before it, so a removal never overtakes the add it follows.
     def _mirror(self, forgets: list, add: Optional[Callable[[], Any]]) -> None:
+        previous = self._write_thread
+
         def run() -> None:
+            if previous:
+                previous.join()
             queue, self._pending_forgets = self._pending_forgets + forgets, []
             for forget in queue:
                 if not _quietly(lambda f=forget: self._client.forget_mirrored(*f) or True, "Supermemory mirrored delete failed", default=False):

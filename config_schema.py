@@ -37,7 +37,7 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             key="memory_scope",
             label="Gateway memory scope",
             kind=KIND_SELECT,
-            default="user",
+            default="shared",
             description="For gateway bots. CLI and Desktop always use the namespace.",
             options=(
                 ProviderFieldOption("user", "Per user", "Each person gets their own memory"),
