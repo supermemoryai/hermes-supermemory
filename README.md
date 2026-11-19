@@ -99,7 +99,7 @@ Existing bots keep `shared`, so every user shares one namespace. To switch, choo
 
 ### Upgrading from 1.0.1
 
-1.0.1 changed `-` and `:` in container tags to `_`, so `hermes-coder` was saved as `hermes_coder`. Names set with the 1.x keys (`container_tag`, `custom_containers`, `SUPERMEMORY_CONTAINER_TAG`) keep that spelling, so memories stay where they are, and the panel shows the saved name (for example `hermes_coder`). Names set with `namespace`, `custom_namespaces` or `SUPERMEMORY_NAMESPACE` are kept as written.
+1.0.1 changed `-` and `:` in container tags to `_`, so `hermes-coder` was saved as `hermes_coder`. Names set with the 1.x keys (`container_tag`, `custom_containers`, `SUPERMEMORY_CONTAINER_TAG`) keep that spelling, so memories stay where they are, and the panel shows the saved name (for example `hermes_coder`). Names set with `namespace`, `custom_namespaces` or `SUPERMEMORY_NAMESPACE` keep `-` and `:`; like any name, other characters outside letters, digits and `_` become `_`.
 
 ### Environment Variables
 
