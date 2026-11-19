@@ -489,11 +489,9 @@ def _probe_supermemory_connection(api_key: str, hermes_home: str, *, identity: s
     return {**status, "ok": True, "profile_facts": facts, "auth": "oauth" if oauth else "api_key"}
 
 
-# Any key, sign-in or config file means this home was set up before, so its memory scope is left alone.
+# Bots from before 2.0 always had an API key, so a key or a config file means this home's memory scope is left alone.
 def _has_prior_setup(api_key: str, hermes_home: str) -> bool:
-    if api_key or any(path.exists() for path in (Path(hermes_home) / "supermemory" / "config.json", Path(hermes_home) / "supermemory.json")):
-        return True
-    return _signed_in(_resolve_base_url(_load_supermemory_config(hermes_home)["base_url"])) is not None
+    return bool(api_key) or any(path.exists() for path in (Path(hermes_home) / "supermemory" / "config.json", Path(hermes_home) / "supermemory.json"))
 
 
 def _sign_in_interactively(base_url: str) -> None:

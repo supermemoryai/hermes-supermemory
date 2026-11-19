@@ -621,7 +621,7 @@ def test_rerunning_setup_keeps_an_existing_bot_on_the_shared_container(api, tmp_
     assert sm._load_supermemory_config(str(tmp_path))["memory_scope"] == "shared"
 
 
-def test_rerunning_setup_keeps_a_signed_in_bot_on_the_shared_container(api, issuer, tmp_path, monkeypatch):
+def test_a_sign_in_from_another_home_does_not_count_as_a_prior_setup(api, issuer, tmp_path, monkeypatch):
     import hermes_cli.config
     import hermes_cli.memory_setup
 
@@ -630,7 +630,7 @@ def test_rerunning_setup_keeps_a_signed_in_bot_on_the_shared_container(api, issu
     monkeypatch.setattr(sm, "get_secret", lambda name, default=None: default)
     save_sign_in()
     SupermemoryMemoryProvider().post_setup(str(tmp_path), {"memory": {"provider": ""}})
-    assert sm._load_supermemory_config(str(tmp_path))["memory_scope"] == "shared"
+    assert sm._load_supermemory_config(str(tmp_path))["memory_scope"] == "user"
 
 
 def test_setup_wizard_writes_the_user_scope(tmp_path):
