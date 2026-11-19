@@ -182,7 +182,7 @@ When enabled:
 
 ## Upgrading from 1.x
 
-- 1.x called namespaces container tags. `container_tag`, `enable_custom_container_tags`, `custom_containers`, `custom_container_instructions` and `SUPERMEMORY_CONTAINER_TAG` still work, and your memories stay searchable under the same name. Nothing needs migrating.
+- 1.x called namespaces container tags. `container_tag`, `enable_custom_container_tags`, `custom_containers`, `custom_container_instructions`, `SUPERMEMORY_CONTAINER_TAG` and the tools' `container_tag` argument still work, and your memories stay searchable under the same name. Nothing needs migrating.
 - New conversations are saved as one document each instead of one per 4-hour window. A conversation that was open during the upgrade keeps its earlier turns where 1.x saved them, and only new turns go into the new document.
 - `search_mode: documents` is now called `chunks`; the old value still works.
 

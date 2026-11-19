@@ -992,8 +992,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
         return [{**s, "name": _KEBAB_ALIASES[s["name"]]} for s in schemas]
 
     def _tool_namespace(self, args: dict) -> Optional[str]:
-        """Validated namespace from args; None = primary. Raises _NamespaceError when not whitelisted."""
-        raw = str(args.get("namespace") or "").strip() if self._enable_custom_namespaces else ""
+        """Validated namespace from args (1.x called it container_tag); None = primary. Raises _NamespaceError when not whitelisted."""
+        raw = str(args.get("namespace") or args.get("container_tag") or "").strip() if self._enable_custom_namespaces else ""
         namespace = _sanitize_namespace(raw) if raw else None
         if namespace and namespace not in self._allowed_namespaces:
             raise _NamespaceError(f"Namespace '{namespace}' is not allowed. Allowed: {', '.join(self._allowed_namespaces)}")

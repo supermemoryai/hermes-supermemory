@@ -399,6 +399,10 @@ def test_1x_container_tag_keys_still_set_the_namespaces(api, tmp_path):
     provider.handle_tool_call("supermemory_search", {"query": "x"})
     provider.handle_tool_call("supermemory_search", {"query": "x", "namespace": "project-alpha"})
     assert [r["path"] for r in api.requests[-2:]] == ["/ns/team-bot/search", "/ns/project-alpha/search"]
+    provider.handle_tool_call("supermemory_search", {"query": "x", "container_tag": "project-alpha"})
+    assert api.requests[-1]["path"] == "/ns/project-alpha/search"
+    refused = json.loads(provider.handle_tool_call("supermemory_search", {"query": "x", "container_tag": "other"}))
+    assert "not allowed" in refused["error"]
 
 
 def test_the_namespace_key_wins_over_container_tag_in_the_same_file(api, tmp_path):
