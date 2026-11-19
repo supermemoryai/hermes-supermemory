@@ -9,11 +9,12 @@ import logging
 import re
 import threading
 import urllib.parse
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import MemoryProvider, RecallStatus
 from agent.secret_scope import get_secret
 from tools.registry import tool_error
 
@@ -30,10 +31,11 @@ except ImportError:  # older Hermes: plain threads
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_CONTAINER_TAG = "hermes"
-_MAX_TAG_LEN = 100
+_DEFAULT_NAMESPACE = "hermes"
+_MAX_NAMESPACE_LEN = 100
 _VALID_SEARCH_MODES = ("hybrid", "memories", "chunks")
 _VALID_DREAMING = ("dynamic", "instant")
+_VALID_SCOPES = ("shared", "user", "chat")
 _SDK_REQUIREMENT = "supermemory>=5.0.0,<6"
 _DEFAULT_BASE_URL = "https://api.supermemory.ai"
 _API_KEY_URL = "https://console.supermemory.ai/keys?create=true"
@@ -41,12 +43,16 @@ _API_KEY_URL = "https://console.supermemory.ai/keys?create=true"
 _INJECTED_BLOCK_RE = re.compile(r"<supermemory-(context|containers)>[\s\S]*?</supermemory-\1>\s*", re.DOTALL)
 _DATA_URI_RE = re.compile(r"data:[^;,\s]+;base64,[A-Za-z0-9+/=]+")  # pasted inline images are useless as memory text
 _READ_WINDOW_CHARS = 8000
+_MAX_QUERY_CHARS = 2000
+_MAX_CACHED_PROFILES = 64
+_RECALL_THRESHOLD = 0.5
+_PANEL_KEYS = ("namespace", "memory_scope", "auto_recall", "auto_capture", "max_recall_results", "search_mode", "threshold",
+               "rerank", "rewrite_query", "include_documents", "include_related", "include_forgotten", "allow_agent_search_overrides")
 _MAX_PENDING_DOCS = 50
 _MAX_PENDING_BYTES = 256 * 1024
 _SUMMARY_END = "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
 _MERGED_PRIOR_HEADER = "[PRIOR CONTEXT — for reference only; not a new message]"
 _MERGED_SUMMARY_DELIMITER = "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]"
-_LEGACY_TEXT: Dict[tuple, str] = {}
 _STORED_TURN_RE = re.compile(r"\[role: user\]\n(.*?)\n\[user:end\](?:\n\[role: assistant\]\n(.*?)\n\[assistant:end\])?", re.DOTALL)
 _DEFAULT_ENTITY_CONTEXT = (
     "User-assistant conversation. Format: [role: user]...[user:end] and [role: assistant]...[assistant:end].\n\n"
@@ -56,7 +62,6 @@ _DEFAULT_ENTITY_CONTEXT = (
     "Do not remember temporary intents, one-time tasks, assistant actions, implementation details, or in-progress status.\n\n"
     "When in doubt, store less."
 )
-# snake_case tool name -> kebab-case alias exposed alongside it.
 _KEBAB_ALIASES = {"supermemory_store": "supermemory-save", "supermemory_search": "supermemory-search",
                   "supermemory_forget": "supermemory-forget", "supermemory_profile": "supermemory-profile",
                   "supermemory_read_document": "supermemory-read-document"}
@@ -75,18 +80,18 @@ def _quietly(fn: Callable[[], Any], fail_msg: str = "", *args: Any, level: int =
 
 
 # The API rejects ids over 100 chars; a hash of the full id keeps long ones that share a prefix distinct.
-def _cap_tag(tag: str) -> str:
-    return tag if len(tag) <= _MAX_TAG_LEN else f"{tag[:_MAX_TAG_LEN - 9]}_{hashlib.sha256(tag.encode()).hexdigest()[:8]}"
+def _cap_namespace(namespace: str) -> str:
+    return namespace if len(namespace) <= _MAX_NAMESPACE_LEN else f"{namespace[:_MAX_NAMESPACE_LEN - 9]}_{hashlib.sha256(namespace.encode()).hexdigest()[:8]}"
 
 
-# Keeps exactly the API's containerTag charset, so a tag the API accepts reaches it unchanged.
-def _sanitize_tag(raw: str) -> str:
-    return _cap_tag("_".join(part for part in re.split(r"[^a-zA-Z0-9_:-]+", raw or "") if part) or _DEFAULT_CONTAINER_TAG)
+# Keeps exactly the API's namespace charset, so a namespace the API accepts reaches it unchanged.
+def _sanitize_namespace(raw: str) -> str:
+    return _cap_namespace("_".join(part for part in re.split(r"[^a-zA-Z0-9_:-]+", raw or "") if part) or _DEFAULT_NAMESPACE)
 
 
-# The 1.0.1 sanitizer, kept only to name the container that version wrote to.
-def _legacy_tag(raw: str) -> str:
-    return re.sub(r"_+", "_", re.sub(r"[^a-zA-Z0-9_]", "_", raw or "")).strip("_") or _DEFAULT_CONTAINER_TAG
+# The 1.0.1 sanitizer: names from 1.x keys keep its spelling.
+def _legacy_namespace(raw: str) -> str:
+    return re.sub(r"_+", "_", re.sub(r"[^a-zA-Z0-9_]", "_", raw or "")).strip("_") or _DEFAULT_NAMESPACE
 
 
 def _resolve_base_url(config_value: Any = "") -> str:
@@ -115,22 +120,40 @@ def _search_mode(value: Any) -> str:
     return mode if mode in _VALID_SEARCH_MODES else "hybrid"
 
 
-# config key -> (default, normalizer). Tags stay raw here and are sanitized once applied, after {identity} expansion.
+# Gateway ids can hold any character, so an id the charset would alter gets a hash of the original to stay distinct.
+def _scoped_namespace(base: str, scope: str, platform: str, user_id: str, chat_id: str) -> str:
+    kind, raw = {"user": ("user", user_id), "chat": ("chat", chat_id)}.get(scope, ("", ""))
+    raw = str(raw or "").strip()
+    if not kind or not raw:
+        return base
+    part = re.sub(r"[^a-zA-Z0-9_:-]", "_", raw)
+    part = part if part == raw else f"{part}_{hashlib.sha256(raw.encode()).hexdigest()[:8]}"
+    return _cap_namespace(f"{base}:{_sanitize_namespace(platform or 'gateway')}:{kind}:{part}")
+
+
+# config key -> (default, normalizer). Namespaces stay raw here and are sanitized once applied, after {identity} expansion.
 _CONFIG_SPEC: Dict[str, tuple] = {
-    "container_tag": (_DEFAULT_CONTAINER_TAG, lambda v: str(v).strip() or _DEFAULT_CONTAINER_TAG),
+    "namespace": (_DEFAULT_NAMESPACE, lambda v: str(v).strip() or _DEFAULT_NAMESPACE),
+    "memory_scope": ("shared", lambda v: v if (v := str(v or "").strip().lower()) in _VALID_SCOPES else "shared"),
     "auto_recall": (True, lambda v: _as_bool(v, True)),
     "auto_capture": (True, lambda v: _as_bool(v, True)),
     "max_recall_results": (10, lambda v: _clamp_number(v, 10, 1, 20, int)),
+    "threshold": (None, lambda v: None if v is None else _clamp_number(v, None, 0.0, 1.0, float)),
+    "rerank": ("none", lambda v: v if (v := str(v or "").strip().lower()) in ("none", "order") else "none"),
+    "rewrite_query": (False, lambda v: _as_bool(v, False)),
+    "include_documents": (False, lambda v: _as_bool(v, False)),
+    "include_related": (False, lambda v: _as_bool(v, False)),
+    "include_forgotten": (False, lambda v: _as_bool(v, False)),
+    "allow_agent_search_overrides": (True, lambda v: _as_bool(v, True)),
     "profile_frequency": (50, lambda v: _clamp_number(v, 50, 1, 500, int)),
-    "capture_mode": ("all", lambda v: "everything" if v == "everything" else "all"),
     "search_mode": ("hybrid", _search_mode),
     "entity_context": (_DEFAULT_ENTITY_CONTEXT, lambda v: _clamp_entity_context(str(v))),
     "dreaming": ("dynamic", lambda v: v if (v := str(v or "").strip().lower()) in _VALID_DREAMING else "dynamic"),
     "api_timeout": (5.0, lambda v: _clamp_number(v, 5.0, 0.5, 15.0, float)),
     "base_url": ("", lambda v: str(v or "").strip()),
-    "enable_custom_container_tags": (False, lambda v: _as_bool(v, False)),
-    "custom_containers": ([], lambda v: [str(t) for t in v if t] if isinstance(v, list) else []),
-    "custom_container_instructions": ("", lambda v: str(v).strip()),
+    "enable_custom_namespaces": (False, lambda v: _as_bool(v, False)),
+    "custom_namespaces": ([], lambda v: [str(t) for t in v if t] if isinstance(v, list) else []),
+    "custom_namespace_instructions": ("", lambda v: str(v).strip()),
 }
 
 
@@ -139,19 +162,55 @@ def _read_json_dict(path: Path) -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
+# 1.x named namespaces "container tags"; its keys are still read, and the new name wins when a file has both.
+_LEGACY_CONFIG_KEYS = (("container_tag", "namespace"), ("enable_custom_container_tags", "enable_custom_namespaces"),
+                       ("custom_containers", "custom_namespaces"), ("custom_container_instructions", "custom_namespace_instructions"))
+
+
+# _1x_namespace / _1x_custom_namespaces record that the name came from a 1.x key, so it keeps 1.0.1's spelling.
+def _read_config_file(path: Path) -> dict:
+    raw = _read_json_dict(path)
+    merged = {**{new: raw.pop(old) for old, new in _LEGACY_CONFIG_KEYS if old in raw}, **raw}
+    return {**merged, **{f"_1x_{key}": key not in raw for key in ("namespace", "custom_namespaces") if merged.get(key) is not None}}
+
+
+# 1.0.1 saved memories under its rewritten name, so a name from a 1.x key keeps that spelling and its memories.
+def _resolve_namespace(raw: str, from_1x: bool) -> str:
+    legacy = _legacy_namespace(raw)
+    return legacy if from_1x and len(legacy) <= _MAX_NAMESPACE_LEN else _sanitize_namespace(raw)
+
+
 def _load_supermemory_config(hermes_home: Optional[str] = None) -> dict:
-    """Defaults overlaid with $hermes_home/supermemory.json (None = defaults only), every key normalized."""
+    """Defaults, then $hermes_home/supermemory.json, then the config panel's supermemory/config.json (None = defaults only)."""
     config = {k: (list(d) if isinstance(d, list) else d) for k, (d, _) in _CONFIG_SPEC.items()}
-    if hermes_home is not None:
-        config.update({k: v for k, v in _read_json_dict(Path(hermes_home) / "supermemory.json").items() if v is not None})
+    for path in (("supermemory.json",), ("supermemory", "config.json")) if hermes_home is not None else ():
+        config.update({k: v for k, v in _read_config_file(Path(hermes_home).joinpath(*path)).items() if v is not None})
     for key, (_, normalize) in _CONFIG_SPEC.items():
         config[key] = normalize(config[key])
     return config
 
 
-def _save_supermemory_config(values: dict, hermes_home: str) -> None:
+# The panel reads only its own file, so an existing supermemory.json is copied there once and the panel shows real values.
+def _seed_panel_config(hermes_home: str, identity: str) -> None:
     from utils import atomic_json_write
-    config_path = Path(hermes_home) / "supermemory.json"
+    legacy_path, panel_path = Path(hermes_home) / "supermemory.json", Path(hermes_home) / "supermemory" / "config.json"
+    if panel_path.exists() or not legacy_path.exists():
+        return
+    legacy = _read_config_file(legacy_path)
+    seeded = {"memory_scope": "shared", **{k: legacy[k] for k in _PANEL_KEYS if legacy.get(k) is not None}}
+    expanded = str(legacy.get("namespace") or "").strip().replace("{identity}", identity)
+    if legacy.get("_1x_namespace") and expanded and _resolve_namespace(expanded, True) != _sanitize_namespace(expanded):
+        seeded["namespace"] = _resolve_namespace(expanded, True)
+    panel_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json_write(panel_path, seeded, mode=0o600, sort_keys=True)
+
+
+# Once the config panel's file exists it wins, so setup writes there too or its choice would be shadowed.
+def _save_supermemory_config(values: dict, hermes_home: str, *, panel: bool = False) -> None:
+    from utils import atomic_json_write
+    panel_path = Path(hermes_home) / "supermemory" / "config.json"
+    config_path = panel_path if panel or panel_path.exists() else Path(hermes_home) / "supermemory.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_json_write(config_path, {**_read_json_dict(config_path), **values}, mode=0o600, sort_keys=True)
 
 
@@ -178,8 +237,8 @@ def _similarity_pct(value: Any) -> Optional[int]:
     return _quietly(lambda: None if value is None else round(float(value) * 100))
 
 
-def _format_prefetch_context(profile: str, search_results: list, max_results: int) -> str:
-    """The markdown profile, then up to ``max_results`` search hits not already in it."""
+def _format_prefetch_context(profile: str, search_results: list, max_results: int) -> tuple:
+    """The markdown profile, then up to ``max_results`` search hits not already in it, and how many hits made it in."""
     seen: set = set()
 
     def _unique(items, key=lambda x: x):  # set.add() returns None, so `not seen.add(k)` records k and keeps the item
@@ -192,8 +251,7 @@ def _format_prefetch_context(profile: str, search_results: list, max_results: in
         pct = _similarity_pct(item.get("similarity"))
         lines.append(f"- {' '.join(([f'[{rel}]'] if rel else []) + ([f'[{pct}%]'] if pct is not None else []))} {item['memory']}".strip())
     sections += ["## Relevant Memories\n" + "\n".join(lines)] if lines else []
-    intro = "The following is background context from long-term memory. Use it silently when relevant. Do not force memories into the conversation."
-    return f"<supermemory-context>\n{intro}\n\n" + "\n\n".join(sections) + "\n</supermemory-context>" if sections else ""
+    return ("<supermemory-context>\n" + "\n\n".join(sections) + "\n</supermemory-context>" if sections else "", len(lines))
 
 
 def _clean_text_for_capture(text: str) -> str:
@@ -209,8 +267,9 @@ def _result_fields(item: dict) -> dict:
     """A v5 search result (memory or document chunk) as the plain dict the formatters use."""
     metadata = item.get("metadata") or {}
     document = (item.get("included") or {}).get("document") or {}
-    return {"id": item.get("id") or "", "memory": item.get("memory") or item.get("chunk") or "",
-            "similarity": item.get("similarity"), "updated_at": item.get("updatedAt") or item.get("updated_at"),
+    return {"id": item.get("id") or "", "memory": item.get("memory") or item.get("chunk") or "", "related": (item.get("included") or {}).get("related"),
+            "similarity": item.get("similarity"),
+            "updated_at": (item.get("system") or {}).get("updatedAt") or item.get("updatedAt") or item.get("updated_at"),
             "document_id": metadata.get("docId") or document.get("id") or item.get("documentId") or "",
             "metadata": metadata}
 
@@ -230,12 +289,12 @@ def _load_sdk():
 
 
 class _SupermemoryClient:
-    """Supermemory v5: the container tag is the namespace every call reads and writes."""
+    """Supermemory v5: every call reads and writes one namespace."""
 
-    def __init__(self, api_key: str, timeout: float, container_tag: str,
+    def __init__(self, api_key: str, timeout: float, namespace: str,
                  search_mode: str = "hybrid", base_url: str = "", oauth: Optional[dict] = None):
         self._sm = _load_sdk()
-        self._api_key, self._container_tag, self._timeout = api_key, container_tag, timeout
+        self._api_key, self._namespace, self._timeout = api_key, namespace, timeout
         self._search_mode = search_mode if search_mode in _VALID_SEARCH_MODES else "hybrid"
         self._base_url = _resolve_base_url(base_url)
         self._client = self._sm.Supermemory(api_key=api_key, base_url=self._base_url, timeout=timeout, max_retries=0,
@@ -251,45 +310,67 @@ class _SupermemoryClient:
         return merged
 
     def add_memory(self, content: str, metadata: Optional[dict] = None, *, entity_context: str = "",
-                   container_tag: Optional[str] = None, dreaming: str = "") -> dict:
+                   namespace: Optional[str] = None, dreaming: str = "", doc_id: str = "") -> dict:
         kwargs: dict[str, Any] = {"content": content.strip(), "date": datetime.now().astimezone().isoformat(timespec="seconds"),
+                                  **({"id": doc_id} if doc_id else {}),
                                   **({"metadata": self._merge_metadata(metadata)} if metadata else {}),
                                   **({"supporting_context": _clamp_entity_context(entity_context)} if entity_context else {}),
                                   **({"dreaming": dreaming} if dreaming else {})}
-        return {"id": _as_dict(self._client.add(container_tag or self._container_tag, **kwargs)).get("id") or ""}
+        return {"id": _as_dict(self._client.add(namespace or self._namespace, **kwargs)).get("id") or ""}
 
     # PATCH replaces the whole document, so a resend, rewind or edit never appends it to itself; the first write creates it.
-    def write_document(self, doc_id: str, content: str, metadata: dict, *, entity_context: str = "", dreaming: str = "") -> None:
+    def write_document(self, doc_id: str, content: str, metadata: dict, *, entity_context: str = "", dreaming: str = "",
+                       namespace: Optional[str] = None) -> None:
+        namespace = namespace or self._namespace
         kwargs: dict[str, Any] = {"content": content.strip(), "date": datetime.now().astimezone().isoformat(timespec="seconds"),
                                   "metadata": self._merge_metadata(metadata),
                                   **({"supporting_context": _clamp_entity_context(entity_context)} if entity_context else {}),
                                   **({"dreaming": dreaming} if dreaming else {})}
         try:
-            self._client.documents.update(self._container_tag, urllib.parse.quote(doc_id, safe=""), **kwargs)
+            self._client.documents.update(namespace, urllib.parse.quote(doc_id, safe=""), **kwargs)
         except self._sm.NotFoundError:
-            self._client.add(self._container_tag, id=doc_id, **kwargs)
+            self._client.add(namespace, id=doc_id, **kwargs)
 
     # 1.0.x wrote a session as appended deltas in one document per 4-hour window, stamped with its session_id and no docId.
     def legacy_capture_text(self, session_id: str) -> str:
-        listed = _as_dict(self._client.list(self._container_tag, "documents", limit=100,
+        listed = _as_dict(self._client.list(self._namespace, "documents", limit=100,
                                             filter={"field": "session_id", "operator": "eq", "value": session_id}))
         ids = [d["id"] for d in listed.get("documents") or []
                if (d.get("metadata") or {}).get("type") == "conversation" and "docId" not in (d.get("metadata") or {})]
-        return "\n\n".join(_as_dict(self._client.documents.get(self._container_tag, urllib.parse.quote(i, safe=""))).get("content") or ""
+        return "\n\n".join(_as_dict(self._client.documents.get(self._namespace, urllib.parse.quote(i, safe=""))).get("content") or ""
                            for i in ids)
 
-    def search_memories(self, query: str, *, limit: int = 5, container_tag: Optional[str] = None,
-                        search_mode: Optional[str] = None, timeout: Optional[float] = None) -> list[dict]:
+    # Mirrors written before stable ids existed are found by their published text, across every page.
+    def forget_mirrored(self, target: str, content: str, namespace: str) -> None:
+        if _as_dict(self._client.documents.delete(namespace, ids=[_mirror_doc_id(target, content)])).get("count"):
+            return
+        ids, page, pages = [], 1, 1
+        while page <= pages:
+            listed = _as_dict(self._client.list(namespace, "documents", page=page, limit=100, include={"content": True}, filter={
+                "operator": "and", "operands": [{"field": "type", "operator": "eq", "value": "explicit_memory"},
+                                                {"field": "target", "operator": "eq", "value": target}]}))
+            ids += [d["id"] for d in listed.get("documents") or [] if (d.get("content") or "").strip() == content]
+            page, pages = page + 1, int((listed.get("pagination") or {}).get("totalPages") or 1)
+        if ids:
+            self._client.documents.delete(namespace, ids=ids)
+
+    def search_memories(self, query: str, *, limit: int = 5, namespace: Optional[str] = None,
+                        search_mode: Optional[str] = None, threshold: Optional[float] = None, rerank: str = "",
+                        rewrite_query: bool = False, include: Optional[dict] = None, timeout: Optional[float] = None) -> list[dict]:
         mode = search_mode or self._search_mode
-        response = self._client.search(container_tag or self._container_tag, query=query, limit=limit,
+        response = self._client.search(namespace or self._namespace, query=query[:_MAX_QUERY_CHARS], limit=limit,
                                        **({"search_mode": mode} if mode in _VALID_SEARCH_MODES else {}),
+                                       **({"threshold": threshold} if threshold is not None else {}),
+                                       **({"rerank": rerank} if rerank and rerank != "none" else {}),
+                                       **({"rewrite_query": True} if rewrite_query else {}),
+                                       **({"include": include} if include else {}),
                                        **({"timeout": timeout} if timeout else {}))
         return [_result_fields(item) for item in _as_dict(response).get("results") or []]
 
-    def get_profile(self, *, container_tag: Optional[str] = None, timeout: Optional[float] = None) -> str:
+    def get_profile(self, *, namespace: Optional[str] = None, timeout: Optional[float] = None) -> str:
         """The profile as markdown (``Accept: text/markdown``), read from the raw response."""
         try:
-            raw = self._client.with_raw_response.profile(container_tag or self._container_tag,
+            raw = self._client.with_raw_response.profile(namespace or self._namespace,
                                                          extra_headers={"Accept": "text/markdown"},
                                                          **({"timeout": timeout} if timeout else {}))
         except self._sm.APIStatusError as error:
@@ -299,29 +380,32 @@ class _SupermemoryClient:
             raise
         return raw.http_response.text
 
-    def read_document(self, doc_id: str, offset: int = 0, *, container_tag: Optional[str] = None,
+    def read_document(self, doc_id: str, offset: int = 0, *, namespace: Optional[str] = None,
                       limit: Optional[int] = _READ_WINDOW_CHARS) -> dict:
-        doc = _as_dict(self._client.documents.get(container_tag or self._container_tag, urllib.parse.quote(doc_id, safe="")))
+        doc = _as_dict(self._client.documents.get(namespace or self._namespace, urllib.parse.quote(doc_id, safe="")))
         content = doc.get("content") or ""
         window = content[offset:offset + limit if limit else None]
         end = offset + len(window)
         return {"id": doc_id, "date": doc.get("date") or (doc.get("metadata") or {}).get("date"), "content": window,
                 "next_offset": end if end < len(content) else None}
 
+    def delete_document(self, doc_id: str, *, namespace: Optional[str] = None) -> None:
+        self._client.documents.delete(namespace or self._namespace, ids=[doc_id])
+
     # V5 answers 200 with per-id errors, so a missing or ineligible id must be read from the body; returns the error or "".
-    def forget_memory(self, memory_id: str, *, container_tag: Optional[str] = None) -> str:
-        result = _as_dict(self._client.memories.forget(container_tag or self._container_tag, ids=[memory_id]))
+    def forget_memory(self, memory_id: str, *, namespace: Optional[str] = None) -> str:
+        result = _as_dict(self._client.memories.forget(namespace or self._namespace, ids=[memory_id]))
         errors = [e.get("error") or "not forgotten" for e in result.get("errors") or [] if e.get("id") == memory_id]
         if errors or memory_id not in {m.get("id") for m in result.get("matches") or []}:
             return errors[0] if errors else "memory not found"
         return ""
 
-    def forget_by_query(self, query: str, *, container_tag: Optional[str] = None) -> dict:
-        results = self.search_memories(query, limit=5, container_tag=container_tag, search_mode="memories")
+    def forget_by_query(self, query: str, *, namespace: Optional[str] = None) -> dict:
+        results = self.search_memories(query, limit=5, namespace=namespace, search_mode="memories")
         memory_id = results[0].get("id", "") if results else ""
         if not memory_id:
             return {"success": False, "message": "Best matching memory has no id." if results else "No matching memory found to forget."}
-        if error := self.forget_memory(memory_id, container_tag=container_tag):
+        if error := self.forget_memory(memory_id, namespace=namespace):
             return {"success": False, "message": f"Could not forget {memory_id}: {error}", "id": memory_id}
         return {"success": True, "message": f'Forgot: "{(results[0].get("memory") or "")[:100]}"', "id": memory_id}
 
@@ -353,8 +437,12 @@ def _format_turn(user: str, assistant: str) -> str:
     return "\n".join(f"[role: {role}]\n{text}\n[{role}:end]" for role, text in (("user", user), ("assistant", assistant)) if text)
 
 
+def _mirror_doc_id(target: str, content: str) -> str:
+    return "hermes_memory_" + hashlib.sha256(f"{target}:{content}".encode()).hexdigest()[:32]
+
+
 def _capture_doc_id(session_id: str) -> str:
-    return _cap_tag(f"hermes_{_sanitize_tag(session_id)}")
+    return _cap_namespace(f"hermes_{_sanitize_namespace(session_id)}")
 
 
 def _message_text(content: Any) -> str:
@@ -395,20 +483,21 @@ def _join_turns(archive: List[Dict[str, str]], turns: List[Dict[str, str]]) -> L
     return archive + rest[tail:]
 
 
-def _build_client(api_key: str, config: dict, container_tag: str, oauth: Optional[dict] = None) -> _SupermemoryClient:
-    return _SupermemoryClient(api_key=api_key, timeout=config["api_timeout"], container_tag=container_tag,
+def _build_client(api_key: str, config: dict, namespace: str, oauth: Optional[dict] = None) -> _SupermemoryClient:
+    return _SupermemoryClient(api_key=api_key, timeout=config["api_timeout"], namespace=namespace,
                               search_mode=config["search_mode"], base_url=_resolve_base_url(config["base_url"]), oauth=oauth)
 
 
-def _expand_container_tag(config_tag: str, identity: str) -> str:
-    """SUPERMEMORY_CONTAINER_TAG (profile-scoped, never the default profile's environ) > config > default, {identity} expanded."""
-    raw_tag = (get_secret("SUPERMEMORY_CONTAINER_TAG", "") or "").strip() or config_tag
-    return raw_tag.replace("{identity}", identity)
+def _expand_namespace(config: dict, identity: str) -> str:
+    """SUPERMEMORY_NAMESPACE, then 1.x's SUPERMEMORY_CONTAINER_TAG (profile-scoped, never the default profile's environ) > config > default, {identity} expanded."""
+    raw, from_1x = next(((v, name == "SUPERMEMORY_CONTAINER_TAG") for name in ("SUPERMEMORY_NAMESPACE", "SUPERMEMORY_CONTAINER_TAG")
+                         if (v := (get_secret(name, "") or "").strip())), (config["namespace"], bool(config.get("_1x_namespace"))))
+    return _resolve_namespace(raw.replace("{identity}", identity), from_1x)
 
 
 def _probe_supermemory_connection(api_key: str, hermes_home: str, *, identity: str = "default") -> dict:
     config = _load_supermemory_config(hermes_home)
-    status = {"ok": False, "error": "", "profile_facts": 0, "container_tag": _sanitize_tag(_expand_container_tag(config["container_tag"], identity)),
+    status = {"ok": False, "error": "", "profile_facts": 0, "namespace": _expand_namespace(config, identity),
               "auto_recall": bool(config["auto_recall"]), "auto_capture": bool(config["auto_capture"])}
     api_key = (api_key or "").strip()
     oauth = None if api_key else _signed_in(_resolve_base_url(config["base_url"]))
@@ -419,11 +508,16 @@ def _probe_supermemory_connection(api_key: str, hermes_home: str, *, identity: s
     except ImportError as exc:
         return {**status, "error": str(exc)}
     try:
-        profile = _build_client(api_key, config, status["container_tag"], oauth=oauth).get_profile()
+        profile = _build_client(api_key, config, status["namespace"], oauth=oauth).get_profile()
     except Exception as exc:
         return {**status, "error": str(exc).strip()[:160] or "connection failed"}
     facts = sum(1 for line in (profile or "").splitlines() if line.startswith("- "))
     return {**status, "ok": True, "profile_facts": facts, "auth": "oauth" if oauth else "api_key"}
+
+
+# A key, a config file or this home already running supermemory means its memory scope is left alone.
+def _has_prior_setup(api_key: str, hermes_home: str, was_active: bool) -> bool:
+    return bool(api_key) or was_active or any(path.exists() for path in (Path(hermes_home) / "supermemory" / "config.json", Path(hermes_home) / "supermemory.json"))
 
 
 def _sign_in_interactively(base_url: str) -> None:
@@ -439,15 +533,14 @@ def _sign_in_interactively(base_url: str) -> None:
 
 
 def _format_connection_summary(status: dict) -> str:
-    container = status.get("container_tag") or _DEFAULT_CONTAINER_TAG
+    namespace = status.get("namespace") or _DEFAULT_NAMESPACE
     flags = f"auto_recall {'on' if status.get('auto_recall') else 'off'} · auto_capture {'on' if status.get('auto_capture') else 'off'}"
     if status.get("ok"):
         facts = int(status.get("profile_facts") or 0)
-        return f"✓ Connected{' via OAuth' if status.get('auth') == 'oauth' else ''} · container: {container} · {facts} profile {'fact' if facts == 1 else 'facts'} · {flags}"
-    return f"✗ {status.get('error') or 'connection failed'} · container: {container} · {flags}"
+        return f"✓ Connected{' via OAuth' if status.get('auth') == 'oauth' else ''} · namespace: {namespace} · {facts} profile {'fact' if facts == 1 else 'facts'} · {flags}"
+    return f"✗ {status.get('error') or 'connection failed'} · namespace: {namespace} · {flags}"
 
 
-# (name, description, ((prop, type, description), ...), required) -> tool schema; kebab aliases are added in get_tool_schemas().
 _BASE_SCHEMAS = [
     {"name": name, "description": description,
      "parameters": {"type": "object", "properties": {p: {"type": t, "description": d} for p, t, d in props}, **({"required": req} if req else {})}}
@@ -468,34 +561,41 @@ _BASE_SCHEMAS = [
 ]
 
 
-class _TagError(Exception):
-    """Tool call named a container_tag outside the whitelist."""
+class _NamespaceError(Exception):
+    """Tool call named a namespace outside the whitelist."""
 
 
-def _tagged(resp: dict, tag: Optional[str]) -> dict:
-    return {**resp, "container_tag": tag} if tag else resp
+def _with_namespace(resp: dict, namespace: Optional[str]) -> dict:
+    return {**resp, "namespace": namespace} if namespace else resp
 
 
 class SupermemoryMemoryProvider(MemoryProvider):
     def __init__(self):
         self._api_key = self._session_id = self._hermes_home = ""
         self._client: Optional[_SupermemoryClient] = None
-        self._container_tag, self._write_enabled, self._active = _DEFAULT_CONTAINER_TAG, True, False
+        self._namespace, self._write_enabled, self._active = _DEFAULT_NAMESPACE, True, False
+        self._base_namespace, self._platform, self._user_id, self._chat_id, self._speaker = _DEFAULT_NAMESPACE, "", "", "", ""
+        self._per_speaker, self._pending_forgets, self._recalled_ids = False, [], set()
+        self._profiles: Dict[str, str] = {}
+        self._profile_jobs: Dict[str, threading.Thread] = {}
+        self._profile_shown: set = set()
+        self._last_recall: Optional[RecallStatus] = None
         self._write_thread = None
         self._turn_count = 0
         self._reset_capture("")
         self._pending: Dict[str, dict] = {}
         self._capture_lock = threading.Lock()  # sync_turn (worker) vs on_session_end/switch/shutdown (caller thread)
         self._apply_config(_load_supermemory_config())
-        self._base_url, self._allowed_containers = _DEFAULT_BASE_URL, []  # env var is only consulted in initialize()
+        self._base_url, self._allowed_namespaces = _DEFAULT_BASE_URL, []  # env var is only consulted in initialize()
 
     def _apply_config(self, config: dict) -> None:
-        for key in ("auto_recall", "auto_capture", "max_recall_results", "profile_frequency", "capture_mode",
-                    "search_mode", "entity_context", "dreaming", "api_timeout", "custom_container_instructions"):
+        for key in ("auto_recall", "auto_capture", "max_recall_results", "threshold", "rerank", "rewrite_query", "include_documents",
+                    "include_related", "include_forgotten", "allow_agent_search_overrides", "profile_frequency",
+                    "search_mode", "entity_context", "dreaming", "api_timeout", "custom_namespace_instructions"):
             setattr(self, f"_{key}", config[key])
-        self._custom_containers = [_sanitize_tag(t) for t in config["custom_containers"]]
-        self._base_url, self._enable_custom_containers = _resolve_base_url(config["base_url"]), config["enable_custom_container_tags"]
-        self._allowed_containers: List[str] = [self._container_tag] + list(self._custom_containers)
+        self._custom_namespaces = [_resolve_namespace(t, bool(config.get("_1x_custom_namespaces"))) for t in config["custom_namespaces"]]
+        self._base_url, self._enable_custom_namespaces = _resolve_base_url(config["base_url"]), config["enable_custom_namespaces"]
+        self._allowed_namespaces: List[str] = [self._namespace] + list(self._custom_namespaces)
 
     @property
     def name(self) -> str:
@@ -509,14 +609,16 @@ class SupermemoryMemoryProvider(MemoryProvider):
         from hermes_constants import get_hermes_home
         return _signed_in(_resolve_base_url(_load_supermemory_config(str(get_hermes_home()))["base_url"])) is not None
 
+    # A new setup scopes gateway memory per person; a config without memory_scope keeps the shared namespace.
     def get_config_schema(self):
-        # Only the API key is prompted during `hermes memory setup`; other options live in supermemory.json / env.
         return [{"key": "api_key", "description": "Supermemory API key (optional: leave blank to sign in with your browser)",
-                 "secret": True, "required": False, "env_var": "SUPERMEMORY_API_KEY", "url": _API_KEY_URL}]
+                 "secret": True, "required": False, "env_var": "SUPERMEMORY_API_KEY", "url": _API_KEY_URL},
+                {"key": "memory_scope", "description": "Gateway memory: one namespace per user, per chat, or shared by everyone",
+                 "choices": ["user", "chat", "shared"], "default": "user"}]
 
     def save_config(self, values, hermes_home):
         sanitized = dict(values or {})
-        for key, fix in (("container_tag", _sanitize_tag), ("entity_context", _clamp_entity_context)):
+        for key, fix in (("namespace", _sanitize_namespace), ("entity_context", _clamp_entity_context)):
             if key in sanitized:
                 sanitized[key] = fix(str(sanitized[key]))
         _save_supermemory_config(sanitized, hermes_home)
@@ -538,8 +640,11 @@ class SupermemoryMemoryProvider(MemoryProvider):
                   f"  or paste an API key from {_API_KEY_URL}\n")
             val = _prompt("Supermemory API key (blank to sign in with your browser)", secret=True)
         memory = config["memory"] = config["memory"] if isinstance(config.get("memory"), dict) else {}
+        was_active = memory.get("provider") == self.name
         memory["provider"] = self.name
         save_config(config)
+        if not _has_prior_setup(existing, hermes_home, was_active):
+            _save_supermemory_config({"memory_scope": "user"}, hermes_home, panel=True)
         if val:
             _write_env_vars({"SUPERMEMORY_API_KEY": val}, hermes_home=hermes_home)
         elif not existing:
@@ -555,64 +660,110 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._hermes_home = kwargs.get("hermes_home") or str(get_hermes_home())
         self._session_id, self._turn_count, self._pending = session_id, 0, {}
         self._reset_capture(session_id)
+        identity = kwargs.get("agent_identity", "default")
+        _quietly(lambda: _seed_panel_config(self._hermes_home, identity), "Failed to copy supermemory.json into the config panel's file", level=logging.WARNING)
         config = _load_supermemory_config(self._hermes_home)
         self._api_key = get_secret("SUPERMEMORY_API_KEY", "") or ""
-        raw_tag = _expand_container_tag(config["container_tag"], kwargs.get("agent_identity", "default"))
-        self._container_tag = _sanitize_tag(raw_tag)
+        self._base_namespace = _expand_namespace(config, identity)
+        self._platform, self._user_id, self._chat_id = (str(kwargs.get(k) or "").strip() for k in ("platform", "user_id", "chat_id"))
+        self._speaker, self._pending_forgets, self._recalled_ids = "", [], set()
+        self._namespace = _scoped_namespace(self._base_namespace, config["memory_scope"], self._platform, self._user_id, self._chat_id)
+        self._per_speaker = config["memory_scope"] == "user" and bool(self._user_id) and str(kwargs.get("chat_type") or "dm") != "dm"
         self._apply_config(config)
         self._write_enabled = kwargs.get("agent_context", "") not in {"cron", "flush", "subagent"}
         oauth = None if self._api_key else _signed_in(self._base_url)
         if not self._api_key and not oauth and _quietly(_auth.load_credentials):
             logger.warning("Supermemory is inactive: %s", _auth.auth_required())
-        self._client = _quietly(lambda: _build_client(self._api_key, config, self._container_tag, oauth=oauth),
+        self._client = _quietly(lambda: _build_client(self._api_key, config, self._namespace, oauth=oauth),
                                 "Supermemory initialization failed", level=logging.WARNING) if self._api_key or oauth else None
         self._active = self._client is not None
-        if self._active:
-            self._warn_legacy_tags_once([raw_tag] + (config["custom_containers"] if self._enable_custom_containers else []))
-
-    # Data saved by 1.0.1 sits under its rewritten tag; a marker file in HERMES_HOME keeps this to one warning per install.
-    def _warn_legacy_tags_once(self, raw_tags: List[str]) -> None:
-        pairs = {(_legacy_tag(raw), _sanitize_tag(raw)) for raw in raw_tags}
-        renamed = sorted((old, new) for old, new in pairs if old != new and len(old) <= _MAX_TAG_LEN)
-        marker = Path(self._hermes_home) / ".supermemory_legacy_tags_warned"
-        if not renamed or marker.exists():
-            return
-        logger.warning("Memories saved by hermes-supermemory 1.0.1 are under the old tag (old -> new): %s. To keep them, set the old name "
-                       "in supermemory.json, or have an org admin merge it into the new tag from Namespaces at console.supermemory.ai "
-                       "after your first save.", ", ".join(f"{old} -> {new}" for old, new in renamed))
-        _quietly(marker.touch, "Failed to write %s", marker)
+        self._profiles, self._profile_jobs, self._profile_shown, self._last_recall = {}, {}, set(), None
+        if self._active and self._auto_recall:
+            self._refresh_profile(self._namespace)
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         self._turn_count = max(turn_number, 0)
+        self._speaker = str(kwargs.get("author_id") or "").strip()
+
+    # Read on every inbound gateway message, so a scope change rebuilds cached agents.
+    def identity_signature(self) -> Dict[str, Any]:
+        from hermes_constants import get_hermes_home
+        return {"supermemory.memory_scope": _load_supermemory_config(str(get_hermes_home()))["memory_scope"]}
+
+    # In a group chat under the user scope, each speaker's turns and recall live in that speaker's namespace.
+    def _speaker_namespace(self, author_id: str = "") -> str:
+        return _scoped_namespace(self._base_namespace, "user", self._platform, author_id, "") if self._per_speaker and author_id else self._namespace
+
+    def _ids(self, author_id: str = "") -> Dict[str, str]:
+        return {k: v for k, v in (("user_id", author_id or self._user_id), ("chat_id", self._chat_id)) if v}
 
     def system_prompt_block(self) -> str:
-        lines = ["# Supermemory", f"Active. Container: {self._container_tag}.",
-                 "Use supermemory-search, supermemory-save, supermemory-forget, supermemory-profile, and supermemory-read-document (aliases: supermemory_search, supermemory_store, supermemory_forget, supermemory_profile, supermemory_read_document)."]
-        if self._enable_custom_containers and self._custom_containers:
-            lines += [f"\nMulti-container mode enabled. Available containers: {', '.join(self._allowed_containers)}.",
-                      "Pass an optional container_tag to supermemory_search, supermemory_store, supermemory_forget, supermemory_profile, and supermemory_read_document to target a specific container."]
-            lines += [f"\n{self._custom_container_instructions}"] if self._custom_container_instructions else []
+        lines = ["# Supermemory", f"Active. Namespace: {self._namespace}.",
+                 "Use supermemory-search, supermemory-save, supermemory-forget, supermemory-profile, and supermemory-read-document."]
+        if self._enable_custom_namespaces and self._custom_namespaces:
+            lines += [f"\nMulti-namespace mode enabled. Available namespaces: {', '.join(self._allowed_namespaces)}.",
+                      "Pass an optional namespace to any supermemory tool to target a specific namespace."]
+            lines += [f"\n{self._custom_namespace_instructions}"] if self._custom_namespace_instructions else []
         return "\n".join(lines) if self._active else ""
 
     def _can_write(self) -> bool:
         return bool(self._active and self._write_enabled and self._client)
 
+    # Shown once per context window (again after a compaction) and every profile_frequency turns.
+    def _profile_due(self, namespace: str, turn: int) -> bool:
+        return namespace not in self._profile_shown or (turn > 0 and turn % self._profile_frequency == 0)
+
+    def _refresh_profile(self, namespace: str) -> None:
+        if (job := self._profile_jobs.get(namespace)) and job.is_alive():
+            return
+
+        def fetch() -> None:
+            profile = _quietly(lambda: self._client.get_profile(namespace=namespace, timeout=self._api_timeout), "Supermemory profile refresh failed")
+            if profile is not None:
+                self._profiles.pop(namespace, None)
+                self._profiles[namespace] = profile
+                while len(self._profiles) > _MAX_CACHED_PROFILES:
+                    self._profiles.pop(next(iter(self._profiles)))
+        self._profile_jobs[namespace] = job = spawn_context_thread(fetch, name="supermemory-profile")
+        job.start()
+
+    def _search_options(self, rerank: str = "") -> Dict[str, Any]:
+        include = {k: True for k in ("documents", "related", "forgotten") if getattr(self, f"_include_{k}")}
+        return {"threshold": self._threshold, "rerank": rerank or self._rerank, "rewrite_query": self._rewrite_query, "include": include}
+
+    def _recall_options(self) -> Dict[str, Any]:
+        return {**self._search_options(), "threshold": _RECALL_THRESHOLD if self._threshold is None else self._threshold}
+
+    # Only the search blocks the turn; the profile comes from the cache that queue_prefetch keeps fresh.
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        self._last_recall = None
         if not self._active or not self._auto_recall or not self._client or not query.strip():
             return ""
-        # Profile and search run in parallel, each bounded by api_timeout; either one failing leaves the other.
-        jobs = {"search": lambda: self._client.search_memories(query, limit=self._max_recall_results, timeout=self._api_timeout)}
-        if self._turn_count <= 1 or self._turn_count % self._profile_frequency == 0:
-            jobs["profile"] = lambda: self._client.get_profile(timeout=self._api_timeout)
-        found: Dict[str, Any] = {}
-        threads = [spawn_context_thread(lambda k=k, fn=fn: found.__setitem__(k, _quietly(fn, "Supermemory recall (%s) failed", k)),
-                                        name=f"supermemory-recall-{k}") for k, fn in jobs.items()]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(self._api_timeout + 0.5)
-        return _quietly(lambda: _format_prefetch_context(found.get("profile") or "", found.get("search") or [], self._max_recall_results),
-                        "Supermemory prefetch failed", default="")
+        namespace = self._speaker_namespace(self._speaker)
+        due = self._profile_due(namespace, self._turn_count)
+        if due and namespace not in self._profiles:
+            self._refresh_profile(namespace)
+        found = _quietly(lambda: self._client.search_memories(query, limit=self._max_recall_results, namespace=namespace, search_mode="memories",
+                                                              timeout=self._api_timeout, **self._recall_options()),
+                         "Supermemory recall failed", default=[])
+        hits = [hit for hit in found if hit.get("id") not in self._recalled_ids]
+        profile = self._profiles.get(namespace, "") if due else ""
+        text, count = _quietly(lambda: _format_prefetch_context(profile, hits, self._max_recall_results),
+                               "Supermemory prefetch failed", default=("", 0))
+        if due and namespace in self._profiles:
+            self._profile_shown.add(namespace)
+        if text:
+            self._recalled_ids.update(hit["id"] for hit in hits if hit.get("id"))
+            self._last_recall = RecallStatus(provider_label="Supermemory", count=count)
+        return text
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        namespace = self._speaker_namespace(self._speaker)
+        if self._active and self._auto_recall and self._client and self._profile_due(namespace, self._turn_count + 1):
+            self._refresh_profile(namespace)
+
+    def recall_status(self) -> Optional[RecallStatus]:
+        return self._last_recall
 
     def _reset_capture(self, session_id: str) -> None:
         self._doc_id, self._doc_session = _capture_doc_id(session_id), session_id
@@ -621,22 +772,29 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._captured_digest: Optional[str] = None
         self._unsent: Optional[dict] = None
         self._legacy_text: Optional[str] = None
+        self._turn_authors: Dict[int, tuple] = {}
+        self._speakers: Dict[str, dict] = {}
 
+    # An empty document is one a rewind emptied, so it is deleted.
     def _write(self, doc_id: str, doc: dict, mode: str) -> bool:
-        return _quietly(lambda: self._client.write_document(doc_id, doc["content"], doc["metadata"], entity_context=self._entity_context,
-                                                            dreaming=self._dreaming) or True,
+        return _quietly(lambda: (self._client.write_document(doc_id, doc["content"], doc["metadata"], entity_context=self._entity_context,
+                                                             dreaming=self._dreaming, namespace=doc.get("namespace")) if doc["content"]
+                                 else self._client.delete_document(doc_id, namespace=doc.get("namespace"))) or True,
                         "Supermemory capture failed (%s, document %s)", mode, doc_id, level=logging.WARNING, default=False)
 
     # Documents of earlier sessions whose last write failed.
     def _retry_pending(self, mode: str) -> None:
-        for doc_id, doc in list(self._pending.items()):
-            if self._write(doc_id, doc, mode):
-                self._pending.pop(doc_id, None)
+        for key, doc in list(self._pending.items()):
+            if self._write(doc.get("doc_id", key), doc, mode):
+                self._pending.pop(key, None)
 
     # A down service must not grow the retry buffer without bound; the oldest documents go first.
     def _park_unsent(self) -> None:
         if self._unsent:
             self._pending[self._doc_id] = self._unsent
+        for namespace, state in self._speakers.items():
+            if state["unsent"]:
+                self._pending[f"{namespace}/{self._doc_id}"] = {**state["unsent"], "doc_id": self._doc_id, "namespace": namespace}
         while len(self._pending) > _MAX_PENDING_DOCS or sum(len(d["content"]) for d in self._pending.values()) > _MAX_PENDING_BYTES:
             dropped = next(iter(self._pending))
             self._pending.pop(dropped)
@@ -644,16 +802,11 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
     # Turns 1.0.x already stored for this session stay in its documents; only the rest go to the 2.0 document.
     def _without_legacy_turns(self, turns: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        key = (self._base_url, self._container_tag, self._doc_session)
-        if self._legacy_text is None and key in _LEGACY_TEXT:
-            self._legacy_text = _LEGACY_TEXT[key]
+        if self._namespace != self._base_namespace:
+            return turns
         if self._legacy_text is None:
             self._legacy_text = "" if len(turns) <= 1 else _quietly(lambda: self._client.legacy_capture_text(self._doc_session),
                                                                      "Supermemory 1.x document lookup failed", level=logging.WARNING)
-            if self._legacy_text is not None and len(turns) > 1:
-                if len(_LEGACY_TEXT) > 256:
-                    _LEGACY_TEXT.clear()
-                _LEGACY_TEXT[key] = self._legacy_text
         if not self._legacy_text:
             return turns
         return turns[next((i for i, t in enumerate(turns) if _format_turn(t["user"], t["assistant"]) not in self._legacy_text), len(turns)):]
@@ -688,14 +841,14 @@ class SupermemoryMemoryProvider(MemoryProvider):
             digest = hashlib.sha256(content.encode()).hexdigest()
             if digest == self._captured_digest and self._unsent is None:
                 return
-            doc = {"content": content, "metadata": {"type": "conversation", "session_id": self._doc_session, "docId": self._doc_id}}
+            doc = {"content": content, "metadata": {"type": "conversation", "session_id": self._doc_session, "docId": self._doc_id, **self._ids()}}
             if self._write(self._doc_id, doc, mode):
                 self._captured_digest, self._unsent = digest, None
             else:
                 self._unsent = doc
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "",
-                  messages: Optional[list] = None) -> None:
+                  messages: Optional[list] = None, turn_author: Optional[dict] = None) -> None:
         # Host runs this on a worker thread, so the blocking write is fine here.
         if not self._can_write() or not self._auto_capture:
             return
@@ -705,22 +858,91 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 "assistant": _clean_text_for_capture(_message_text(assistant_content))}
         if messages is None and turn["user"]:
             self._turns.append(turn)
-        self._capture("turn", messages, completed_only=True)
+        if self._per_speaker and self._can_write() and self._auto_capture:
+            author = str((turn_author or {}).get("id") or self._speaker or self._user_id)
+            self._capture_speakers("turn", messages, completed_only=True, author=(author, turn["user"], turn["assistant"]))
+            return
+        self._flush("turn", messages, completed_only=True)
 
-    def _flush(self, mode: str, messages: Optional[list] = None) -> None:
+    # The stored turns of a speaker's document, [] when it does not exist yet, None when the read failed.
+    def _stored_turns(self, namespace: str) -> Optional[List[Dict[str, str]]]:
+        try:
+            stored = self._client.read_document(self._doc_id, 0, namespace=namespace, limit=None)["content"]
+        except self._client._sm.NotFoundError:
+            return []
+        except Exception:
+            logger.warning("Supermemory: could not read %s in %s; its next write waits", self._doc_id, namespace, exc_info=True)
+            return None
+        return [{"user": u, "assistant": a} for u, a in _STORED_TURN_RE.findall(stored)]
+
+    # Without a compaction the transcript is the whole truth: a speaker owns the places they wrote plus as many matching places as their document stores.
+    def _speaker_turns(self, speaker: str, stored: List[Dict[str, str]], turns: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        owners = {i: a for i, (a, user) in self._turn_authors.items() if i < len(turns) and turns[i]["user"] == user}
+        remaining, owned = Counter((t["user"], t["assistant"]) for t in stored), []
+        for i, turn in enumerate(turns):
+            key = (turn["user"], turn["assistant"])
+            if owners.get(i, speaker if remaining[key] > 0 else None) == speaker:
+                remaining[key] -= 1
+                owned.append(turn)
+        return owned
+
+    def _capture_speakers(self, mode: str, messages: Optional[list], *, completed_only: bool = False, author: Optional[tuple] = None) -> None:
+        with self._capture_lock:
+            self._retry_pending(mode)
+            turns = _turns_from_messages(messages) if messages is not None else self._turns
+            if completed_only and turns and not turns[-1]["assistant"]:
+                turns = turns[:-1]
+            own = _clean_text_for_capture(_without_compaction_summary(author[1])) if author else ""
+            matches = [i for i, t in enumerate(turns) if t["user"] == own] if own else []
+            synced = next((i for i in reversed(matches) if turns[i]["assistant"] == author[2]), matches[-1] if matches else None)
+            if synced is not None:
+                self._turn_authors[synced] = (author[0], own)
+            complete = messages is not None and not any(isinstance(m, dict) and m.get("_compressed_summary") for m in messages)
+            speakers = {self._speaker_namespace(a): a for a, _ in self._turn_authors.values()}
+            speakers.update({namespace: state["author"] for namespace, state in self._speakers.items() if namespace not in speakers})
+            for namespace, speaker in speakers.items():
+                state = self._speakers.setdefault(namespace, {"author": speaker, "archive": None, "turns": [], "digest": None, "unsent": None})
+                if messages is not None or author:
+                    state["turns"] = [turns[i] for i, (a, user) in sorted(self._turn_authors.items())
+                                      if a == speaker and i < len(turns) and turns[i]["user"] == user]
+                if state["archive"] is None:
+                    state["archive"] = self._stored_turns(namespace)
+                if state["archive"] is None:
+                    continue
+                state["content_turns"] = (self._speaker_turns(speaker, state["archive"], turns) if complete
+                                          else _join_turns(state["archive"], state["turns"]))
+                content = "\n\n".join(_format_turn(t["user"], t["assistant"]) for t in state["content_turns"])
+                digest = hashlib.sha256(content.encode()).hexdigest()
+                if (digest == state["digest"] and state["unsent"] is None) or (not content and not (complete and turns and (state["digest"] or state["archive"]))):
+                    continue
+                doc = {"content": content, "namespace": namespace,
+                       "metadata": {"type": "conversation", "session_id": self._doc_session, "docId": self._doc_id, **self._ids(speaker)}}
+                if self._write(self._doc_id, doc, mode):
+                    state["digest"], state["unsent"] = digest, None
+                    state["archive"] = state["archive"] if content else []
+                else:
+                    state["unsent"] = doc
+
+    def _flush(self, mode: str, messages: Optional[list] = None, *, completed_only: bool = False) -> None:
         if self._can_write() and self._auto_capture:
-            self._capture(mode, messages)
+            capture = self._capture_speakers if self._per_speaker else self._capture
+            capture(mode, messages, completed_only=completed_only)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        self._flush("session_end", messages)
+        self._flush("session_end", messages, completed_only=True)
 
     # Compaction continues the conversation and its document; a rewind needs nothing, the next transcript rewrites it.
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False, **kwargs) -> None:
         new_id = str(new_session_id or "").strip()
+        self._recalled_ids, self._profile_shown = set(), set()
         if kwargs.get("reason") == "compression":
             self._flush("session_switch")
             with self._capture_lock:
                 self._archive, self._turns = _join_turns(self._archive, self._turns), []
+                self._turn_authors = {}
+                for state in self._speakers.values():
+                    if state["archive"] is not None:
+                        state["archive"], state["turns"] = state.get("content_turns", state["archive"]), []
         elif (new_id and new_id != self._session_id) or reset:
             self._flush("session_switch")
             with self._capture_lock:
@@ -730,92 +952,125 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 self._turn_count = 0
         self._session_id = new_id or self._session_id
 
-    def on_memory_write(self, action: str, target: str, content: str) -> None:
-        if not self._can_write() or action != "add" or not (content or "").strip():
-            return
+    # A replace or remove deletes the mirrored copy of the entry it changed; a failed delete is retried with the next mirror write.
+    def on_memory_write(self, action: str, target: str, content: str, metadata: Optional[dict] = None) -> None:
+        content, previous = (content or "").strip(), str((metadata or {}).get("previous_content") or "").strip()
+        namespace, speaker = self._speaker_namespace(self._speaker), self._speaker
+        forgets = [(target, previous, namespace)] if action in {"replace", "patch", "remove"} and previous else []
+        add = (lambda: self._client.add_memory(content, metadata={"target": target, "type": "explicit_memory", **self._ids(speaker)},
+                                               entity_context=self._entity_context, namespace=namespace, dreaming=self._dreaming,
+                                               doc_id=_mirror_doc_id(target, content))) if action in {"add", "replace", "patch"} and content else None
+        if self._can_write() and (forgets or add):
+            self._mirror(forgets, add)
+
+    # Each mirror worker waits for the one before it, so a removal never overtakes the add it follows.
+    def _mirror(self, forgets: list, add: Optional[Callable[[], Any]]) -> None:
+        previous = self._write_thread
+
+        def run() -> None:
+            if previous:
+                previous.join()
+            queue, self._pending_forgets = self._pending_forgets + forgets, []
+            for forget in queue:
+                if not _quietly(lambda f=forget: self._client.forget_mirrored(*f) or True, "Supermemory mirrored delete failed", default=False):
+                    self._pending_forgets.append(forget)
+            del self._pending_forgets[:-_MAX_PENDING_DOCS]
+            _quietly(add or (lambda: None), "Supermemory on_memory_write failed")
         if self._write_thread and self._write_thread.is_alive():
             self._write_thread.join(timeout=2.0)
-        self._write_thread = spawn_context_thread(
-            _quietly, daemon=False, name="supermemory-memory-write",
-            args=(lambda: self._client.add_memory(content.strip(), metadata={"target": target, "type": "explicit_memory"},
-                                                  entity_context=self._entity_context, dreaming=self._dreaming),
-                  "Supermemory on_memory_write failed"))
+        self._write_thread = spawn_context_thread(run, daemon=False, name="supermemory-memory-write")
         self._write_thread.start()
 
     def shutdown(self) -> None:
         self._flush("shutdown")
+        if self._pending_forgets and self._can_write():
+            self._mirror([], None)
         if self._write_thread and self._write_thread.is_alive():
             self._write_thread.join(timeout=5.0)
         self._write_thread = None
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         schemas = [json.loads(json.dumps(base)) for base in _BASE_SCHEMAS]  # deep copies
-        for schema in schemas if self._enable_custom_containers else ():  # multi-container mode: every tool takes container_tag
-            schema["parameters"]["properties"]["container_tag"] = {
-                "type": "string", "description": f"Optional container tag. Allowed: {', '.join(self._allowed_containers)}. Defaults to primary ({self._container_tag})."}
-        # Kebab-case aliases are appended after all snake_case schemas (deep-copied, name swapped).
-        return schemas + [{**json.loads(json.dumps(s)), "name": _KEBAB_ALIASES[s["name"]]} for s in schemas]
+        for schema in schemas if self._enable_custom_namespaces else ():  # multi-namespace mode: every tool takes namespace
+            schema["parameters"]["properties"]["namespace"] = {
+                "type": "string", "description": f"Optional namespace. Allowed: {', '.join(self._allowed_namespaces)}. Defaults to primary ({self._namespace})."}
+        if self._allow_agent_search_overrides:
+            search = next(s for s in schemas if s["name"] == "supermemory_search")["parameters"]["properties"]
+            search["search_mode"] = {"type": "string", "enum": list(_VALID_SEARCH_MODES), "description": f"Defaults to {self._search_mode}."}
+            search["aggregate"] = {"type": "boolean", "description": "Merge overlapping results into cleaner answers; slower."}
+        return [{**s, "name": _KEBAB_ALIASES[s["name"]]} for s in schemas]
 
-    def _tool_container_tag(self, args: dict) -> Optional[str]:
-        """Validated container_tag from args; None = primary. Raises _TagError when not whitelisted."""
-        raw = str(args.get("container_tag") or "").strip() if self._enable_custom_containers else ""
-        tag = _sanitize_tag(raw) if raw else None
-        if tag and tag not in self._allowed_containers:
-            raise _TagError(f"Container tag '{tag}' is not allowed. Allowed: {', '.join(self._allowed_containers)}")
-        return tag
+    def _tool_namespace(self, args: dict) -> Optional[str]:
+        """Validated namespace from args (1.x called it container_tag); None = primary. Raises _NamespaceError when not whitelisted."""
+        raw = str(args.get("namespace") or args.get("container_tag") or "").strip() if self._enable_custom_namespaces else ""
+        namespace = _sanitize_namespace(raw) if raw else None
+        if namespace and namespace not in self._allowed_namespaces and _legacy_namespace(raw) in self._allowed_namespaces:
+            namespace = _legacy_namespace(raw)
+        if namespace and namespace not in self._allowed_namespaces:
+            raise _NamespaceError(f"Namespace '{namespace}' is not allowed. Allowed: {', '.join(self._allowed_namespaces)}")
+        return namespace
+
+    def _tool_target(self, namespace: Optional[str]) -> str:
+        return namespace or self._speaker_namespace(self._speaker)
 
     def _tool_store(self, args: dict) -> dict | str:
         content = str(args.get("content") or "").strip()
         if not content:
             return tool_error("content is required")
-        metadata = args.get("metadata") if isinstance(args.get("metadata"), dict) else {}
+        metadata = dict(args["metadata"]) if isinstance(args.get("metadata"), dict) else {}
         metadata.setdefault("type", _detect_category(content))
         metadata.pop("source", None)
-        tag = self._tool_container_tag(args)
-        result = self._client.add_memory(content, metadata=metadata, entity_context=self._entity_context, container_tag=tag,
-                                         dreaming=self._dreaming)
-        return _tagged({"saved": True, "id": result.get("id", ""), "preview": content[:80] + ("..." if len(content) > 80 else "")}, tag)
+        namespace = self._tool_namespace(args)
+        result = self._client.add_memory(content, metadata={**self._ids(self._speaker), **metadata}, entity_context=self._entity_context,
+                                         namespace=self._tool_target(namespace), dreaming=self._dreaming)
+        return _with_namespace({"saved": True, "id": result.get("id", ""), "preview": content[:80] + ("..." if len(content) > 80 else "")}, namespace)
 
     def _tool_search(self, args: dict) -> dict | str:
         query = str(args.get("query") or "").strip()
         if not query:
             return tool_error("query is required")
         limit = _clamp_number(args.get("limit", 5) or 5, 5, 1, 20, int)
-        tag = self._tool_container_tag(args)
+        namespace = self._tool_namespace(args)
+        overrides = self._allow_agent_search_overrides
+        mode = _search_mode(args["search_mode"]) if overrides and args.get("search_mode") else None
+        rerank = "aggregate" if overrides and _as_bool(args.get("aggregate"), False) else ""
         results = [{"id": i.get("id", ""), "content": i.get("memory", ""),
                     **({"document_id": i["document_id"]} if i.get("document_id") else {}),
-                    **({"similarity": pct} if (pct := _similarity_pct(i.get("similarity"))) is not None else {})}
-                   for i in self._client.search_memories(query, limit=limit, container_tag=tag)]
-        return _tagged({"results": results, "count": len(results)}, tag)
+                    **({"similarity": pct} if (pct := _similarity_pct(i.get("similarity"))) is not None else {}),
+                    **({"related": i["related"]} if i.get("related") else {})}
+                   for i in self._client.search_memories(query, limit=limit, namespace=self._tool_target(namespace), search_mode=mode,
+                                                         **self._search_options(rerank))]
+        return _with_namespace({"results": results, "count": len(results)}, namespace)
 
     def _tool_forget(self, args: dict) -> dict | str:
         memory_id, query = str(args.get("id") or "").strip(), str(args.get("query") or "").strip()
         if not memory_id and not query:
             return tool_error("Provide either id or query")
-        tag = self._tool_container_tag(args)  # not echoed in the response
+        namespace = self._tool_namespace(args)  # not echoed in the response
         if not memory_id:
-            return self._client.forget_by_query(query, container_tag=tag)
-        if error := self._client.forget_memory(memory_id, container_tag=tag):
+            return self._client.forget_by_query(query, namespace=self._tool_target(namespace))
+        if error := self._client.forget_memory(memory_id, namespace=self._tool_target(namespace)):
             return tool_error(f"Forget failed: {error}")
         return {"forgotten": True, "id": memory_id}
 
     def _tool_profile(self, args: dict) -> dict:
-        tag = self._tool_container_tag(args)
+        namespace = self._tool_namespace(args)
         query = str(args.get("query") or "").strip()
-        resp = {"profile": self._client.get_profile(container_tag=tag)}
+        resp = {"profile": self._client.get_profile(namespace=self._tool_target(namespace))}
         if query:
             resp["results"] = [{"id": i.get("id", ""), "content": i.get("memory", ""),
                                 **({"similarity": pct} if (pct := _similarity_pct(i.get("similarity"))) is not None else {})}
-                               for i in self._client.search_memories(query, limit=self._max_recall_results, container_tag=tag)]
-        return _tagged(resp, tag)
+                               for i in self._client.search_memories(query, limit=self._max_recall_results, namespace=self._tool_target(namespace),
+                                                                     **self._search_options())]
+        return _with_namespace(resp, namespace)
 
     def _tool_read_document(self, args: dict) -> dict | str:
         document_id = str(args.get("document_id") or "").strip()
         if not document_id:
             return tool_error("document_id is required")
         offset = _clamp_number(args.get("offset") or 0, 0, 0, 10**9, int)
-        tag = self._tool_container_tag(args)
-        return _tagged(self._client.read_document(document_id, offset, container_tag=tag), tag)
+        namespace = self._tool_namespace(args)
+        return _with_namespace(self._client.read_document(document_id, offset, namespace=self._tool_target(namespace)), namespace)
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         """Handlers return a tool_error() string for bad args or a dict to JSON-encode; client failures get ``fail_prefix``."""
@@ -828,10 +1083,9 @@ class SupermemoryMemoryProvider(MemoryProvider):
         try:
             resp = handler(self, args)
         except Exception as exc:
-            return tool_error(str(exc) if isinstance(exc, _TagError) else f"{fail_prefix}: {exc}")
+            return tool_error(str(exc) if isinstance(exc, _NamespaceError) else f"{fail_prefix}: {exc}")
         return resp if isinstance(resp, str) else json.dumps(resp)
 
-    # snake_case tool name -> (handler, error prefix); kebab aliases are folded in via _ALIAS_TO_TOOL first.
     _TOOL_HANDLERS = {"supermemory_store": (_tool_store, "Failed to store memory"), "supermemory_search": (_tool_search, "Search failed"),
                       "supermemory_forget": (_tool_forget, "Forget failed"), "supermemory_profile": (_tool_profile, "Profile failed"),
                       "supermemory_read_document": (_tool_read_document, "Read failed")}
@@ -839,59 +1093,3 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
 def register(ctx):
     ctx.register_memory_provider(SupermemoryMemoryProvider())
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-
-FORGET_SCHEMA = {
-    "name": "supermemory_forget",
-    "description": "Forget a memory by exact id or by best-match query.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "id": {"type": "string", "description": "Exact memory id to delete."},
-            "query": {"type": "string", "description": "Query used to find the memory to forget."},
-        },
-    },
-}
-
-PROFILE_SCHEMA = {
-    "name": "supermemory_profile",
-    "description": "Retrieve the user's profile: persistent facts and recent memory context.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "Optional query; matching memories are returned alongside the profile."},
-        },
-    },
-}
-
-SEARCH_SCHEMA = {
-    "name": "supermemory_search",
-    "description": "Search long-term memory by semantic similarity.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "What to search for."},
-            "limit": {"type": "integer", "description": "Maximum results to return, 1 to 20."},
-        },
-        "required": ["query"],
-    },
-}
-
-STORE_SCHEMA = {
-    "name": "supermemory_store",
-    "description": "Store an explicit memory for future recall.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "content": {"type": "string", "description": "The memory content to store."},
-            "metadata": {"type": "object", "description": "Optional metadata attached to the memory."},
-        },
-        "required": ["content"],
-    },
-}
-# ---- END PLUGIN-COMPAT ----
