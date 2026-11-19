@@ -115,7 +115,7 @@ for SDK operations and setup/status probes.
 
 ## Tools
 
-Only the kebab-case names are sent to the model; calls using the snake_case names still work.
+Only the kebab-case names are registered. 1.x also registered snake_case names such as `supermemory_search`; Hermes now refuses those, and the model retries with the names it is given.
 
 | Tool | Alias | Description |
 |------|-------|-------------|
