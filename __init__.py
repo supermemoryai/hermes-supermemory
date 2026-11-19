@@ -206,10 +206,11 @@ def _seed_panel_config(hermes_home: str, identity: str) -> None:
 
 
 # Once the config panel's file exists it wins, so setup writes there too or its choice would be shadowed.
-def _save_supermemory_config(values: dict, hermes_home: str) -> None:
+def _save_supermemory_config(values: dict, hermes_home: str, *, panel: bool = False) -> None:
     from utils import atomic_json_write
     panel_path = Path(hermes_home) / "supermemory" / "config.json"
-    config_path = panel_path if panel_path.exists() else Path(hermes_home) / "supermemory.json"
+    config_path = panel_path if panel or panel_path.exists() else Path(hermes_home) / "supermemory.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_json_write(config_path, {**_read_json_dict(config_path), **values}, mode=0o600, sort_keys=True)
 
 
@@ -643,7 +644,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         memory["provider"] = self.name
         save_config(config)
         if not _has_prior_setup(existing, hermes_home, was_active):
-            _save_supermemory_config({"memory_scope": "user"}, hermes_home)
+            _save_supermemory_config({"memory_scope": "user"}, hermes_home, panel=True)
         if val:
             _write_env_vars({"SUPERMEMORY_API_KEY": val}, hermes_home=hermes_home)
         elif not existing:

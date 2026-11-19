@@ -655,6 +655,7 @@ def test_a_first_setup_defaults_to_the_user_scope(api, tmp_path, monkeypatch):
     monkeypatch.setattr(sm, "get_secret", lambda name, default=None: default)
     SupermemoryMemoryProvider().post_setup(str(tmp_path), {})
     assert sm._load_supermemory_config(str(tmp_path))["memory_scope"] == "user"
+    assert json.loads((tmp_path / "supermemory" / "config.json").read_text()) == {"memory_scope": "user"}
 
 
 def test_rerunning_setup_keeps_an_existing_bot_on_the_shared_namespace(api, tmp_path, monkeypatch):
