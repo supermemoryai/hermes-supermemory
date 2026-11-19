@@ -77,7 +77,7 @@ Config files: `$HERMES_HOME/supermemory.json`, and `$HERMES_HOME/supermemory/con
 | Key | Default | Description |
 |-----|---------|-------------|
 | `base_url` | `https://api.supermemory.ai` | API endpoint for hosted or self-hosted Supermemory. Takes priority over `SUPERMEMORY_BASE_URL`. |
-| `namespace` | `hermes` | Namespace used for search and writes. Supports `{identity}` for profile-scoped namespaces (e.g. `hermes-{identity}` → `hermes-coder`). Letters, digits, `_`, `-` and `:` are kept; other characters become `_`. Namespaces over 100 characters are shortened to 100, ending in `_` and an 8-character hash of the full name so they stay distinct. |
+| `namespace` | `hermes` | Namespace used for search and writes. Supports `{identity}` for profile-scoped namespaces (e.g. `hermes-{identity}` → `hermes-coder`). ASCII letters, digits, `_`, `-` and `:` are kept. Each run of other characters becomes one `_`, and runs at the start or end are dropped. Namespaces over 100 characters are shortened to 100, ending in `_` and an 8-character hash of the full name so they stay distinct. |
 | `memory_scope` | `shared` | Gateway bots only: `user` gives each person their own namespace, `chat` each conversation, `shared` one for everyone. CLI and Desktop always use `namespace`. New setups choose `user`. |
 | `auto_recall` | `true` | Inject relevant memory context before turns |
 | `auto_capture` | `true` | Store cleaned user-assistant turns after each response |
@@ -99,7 +99,7 @@ Existing bots keep `shared`, so every user shares one namespace. To switch, choo
 
 ### Upgrading from 1.0.1
 
-1.0.1 changed `-` and `:` in container tags to `_`, so `hermes-coder` was saved as `hermes_coder`. Names set with the 1.x keys (`container_tag`, `custom_containers`, `SUPERMEMORY_CONTAINER_TAG`) keep that spelling, so memories stay where they are, and the panel shows the saved name (for example `hermes_coder`). Names set with `namespace`, `custom_namespaces` or `SUPERMEMORY_NAMESPACE` keep `-` and `:`; like any name, other characters outside letters, digits and `_` become `_`.
+1.0.1 changed `-` and `:` in container tags to `_`, so `hermes-coder` was saved as `hermes_coder`. Names set with the 1.x keys (`container_tag`, `custom_containers`, `SUPERMEMORY_CONTAINER_TAG`) keep that spelling, so memories stay where they are, and the panel shows the saved name (for example `hermes_coder`). Names set with `namespace`, `custom_namespaces` or `SUPERMEMORY_NAMESPACE` keep `-` and `:`, and other characters are handled as described for `namespace` above.
 
 ### Environment Variables
 
