@@ -608,6 +608,9 @@ def test_rerunning_setup_keeps_an_existing_bot_on_the_shared_container(api, tmp_
     (tmp_path / "supermemory.json").write_text(json.dumps({"container_tag": "team-bot"}))
     SupermemoryMemoryProvider().post_setup(str(tmp_path), {})
     assert sm._load_supermemory_config(str(tmp_path))["memory_scope"] == "shared"
+    (tmp_path / "supermemory.json").unlink()
+    SupermemoryMemoryProvider().post_setup(str(tmp_path), {"memory": {"provider": "supermemory"}})
+    assert sm._load_supermemory_config(str(tmp_path))["memory_scope"] == "shared"
 
 
 def test_setup_wizard_writes_the_user_scope(tmp_path):

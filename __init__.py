@@ -609,9 +609,10 @@ class SupermemoryMemoryProvider(MemoryProvider):
                   f"  or paste an API key from {_API_KEY_URL}\n")
             val = _prompt("Supermemory API key (blank to sign in with your browser)", secret=True)
         memory = config["memory"] = config["memory"] if isinstance(config.get("memory"), dict) else {}
+        was_active = memory.get("provider") == self.name
         memory["provider"] = self.name
         save_config(config)
-        if not any(path.exists() for path in (Path(hermes_home) / "supermemory" / "config.json", Path(hermes_home) / "supermemory.json")):
+        if not was_active and not any(path.exists() for path in (Path(hermes_home) / "supermemory" / "config.json", Path(hermes_home) / "supermemory.json")):
             _save_supermemory_config({"memory_scope": "user"}, hermes_home)
         if val:
             _write_env_vars({"SUPERMEMORY_API_KEY": val}, hermes_home=hermes_home)
