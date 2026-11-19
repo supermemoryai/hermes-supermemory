@@ -860,7 +860,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
             self._turns.append(turn)
         if self._per_speaker and self._can_write() and self._auto_capture:
             author = str((turn_author or {}).get("id") or self._speaker or self._user_id)
-            self._capture_speakers("turn", messages, completed_only=True, author=(author, turn["user"]))
+            self._capture_speakers("turn", messages, completed_only=True, author=(author, turn["user"], turn["assistant"]))
             return
         self._flush("turn", messages, completed_only=True)
 
@@ -893,7 +893,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
             if completed_only and turns and not turns[-1]["assistant"]:
                 turns = turns[:-1]
             own = _clean_text_for_capture(_without_compaction_summary(author[1])) if author else ""
-            synced = next((i for i in range(len(turns) - 1, -1, -1) if turns[i]["user"] == own), None) if own else None
+            matches = [i for i, t in enumerate(turns) if t["user"] == own] if own else []
+            synced = next((i for i in reversed(matches) if turns[i]["assistant"] == author[2]), matches[-1] if matches else None)
             if synced is not None:
                 self._turn_authors[synced] = (author[0], own)
             complete = messages is not None and not any(isinstance(m, dict) and m.get("_compressed_summary") for m in messages)

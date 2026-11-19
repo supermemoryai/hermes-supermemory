@@ -1126,6 +1126,19 @@ def test_group_turn_merged_with_a_compaction_summary_is_still_stored(api, tmp_pa
 
 
 
+@pytest.mark.parametrize("speakers", [("42", "7"), ("42", "42")], ids=["two-speakers", "one-speaker"])
+def test_same_text_turns_are_told_apart_by_their_reply_when_the_transcript_runs_ahead(api, tmp_path, speakers):
+    scope(tmp_path, "user")
+    provider = make_provider(tmp_path, **{**GATEWAY, "chat_type": "group"})
+    ahead = transcript(("yes", "Noted, Ann."), ("yes", "Noted, Bo."))
+    for author, reply in zip(speakers, ("Noted, Ann.", "Noted, Bo.")):
+        provider.sync_turn("yes", reply, messages=ahead, turn_author={"id": author, "name": None, "is_bot": False})
+    yes = lambda reply: f"[role: user]\nyes\n[user:end]\n[role: assistant]\n{reply}\n[assistant:end]"
+    expected = ({"hermes:telegram:user:42/hermes_session-1": yes("Noted, Ann."), "hermes:telegram:user:7/hermes_session-1": yes("Noted, Bo.")}
+                if speakers[1] == "7" else {"hermes:telegram:user:42/hermes_session-1": yes("Noted, Ann.") + "\n\n" + yes("Noted, Bo.")})
+    assert api.captures() == expected
+
+
 def test_group_turn_is_attributed_where_it_sits_when_the_transcript_runs_ahead(api, tmp_path):
     scope(tmp_path, "user")
     provider = make_provider(tmp_path, **{**GATEWAY, "chat_type": "group"})
