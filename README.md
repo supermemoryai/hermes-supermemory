@@ -77,8 +77,8 @@ Config files: `$HERMES_HOME/supermemory.json`, and `$HERMES_HOME/supermemory/con
 | Key | Default | Description |
 |-----|---------|-------------|
 | `base_url` | `https://api.supermemory.ai` | API endpoint for hosted or self-hosted Supermemory. Takes priority over `SUPERMEMORY_BASE_URL`. |
-| `container_tag` | `hermes` | Container tag (namespace) used for search and writes. Supports `{identity}` template for profile-scoped tags (e.g. `hermes-{identity}` → `hermes-coder`). Letters, digits, `_`, `-` and `:` are kept; other characters become `_`. Tags over 100 characters are shortened to 100, ending in `_` and an 8-character hash of the full tag so they stay distinct. |
-| `memory_scope` | `shared` | Gateway bots only: `user` gives each person their own container, `chat` each conversation, `shared` one for everyone. CLI and Desktop always use `container_tag`. New setups choose `user`. |
+| `namespace` | `hermes` | Namespace used for search and writes. Supports `{identity}` for profile-scoped namespaces (e.g. `hermes-{identity}` → `hermes-coder`). Letters, digits, `_`, `-` and `:` are kept; other characters become `_`. Namespaces over 100 characters are shortened to 100, ending in `_` and an 8-character hash of the full name so they stay distinct. |
+| `memory_scope` | `shared` | Gateway bots only: `user` gives each person their own namespace, `chat` each conversation, `shared` one for everyone. CLI and Desktop always use `namespace`. New setups choose `user`. |
 | `auto_recall` | `true` | Inject relevant memory context before turns |
 | `auto_capture` | `true` | Store cleaned user-assistant turns after each response |
 | `max_recall_results` | `10` | Max search results recalled with the profile (1-20) |
@@ -95,13 +95,13 @@ Config files: `$HERMES_HOME/supermemory.json`, and `$HERMES_HOME/supermemory/con
 
 ### Gateway memory scope
 
-Existing bots keep `shared`, so every user shares one container. To switch, choose "Per user" in the panel or set `"memory_scope": "user"` in `supermemory/config.json`; memories saved while shared stay in the old container.
+Existing bots keep `shared`, so every user shares one namespace. To switch, choose "Per user" in the panel or set `"memory_scope": "user"` in `supermemory/config.json`; memories saved while shared stay in the old namespace.
 
 ### Upgrading from 1.0.1
 
-1.0.1 changed `-` and `:` in tags to `_`, so `hermes-coder` was saved as `hermes_coder`. From 1.0.2 tags are kept as written, so memories saved before the upgrade stay under the old name. The plugin logs the old and new name once.
+1.0.1 changed `-` and `:` in container tags to `_`, so `hermes-coder` was saved as `hermes_coder`. From 1.0.2 names are kept as written, so memories saved before the upgrade stay under the old name. The plugin logs the old and new name once.
 
-To keep those memories, either set the old name in the panel or `supermemory/config.json` (`"container_tag": "hermes_coder"`), or have an org admin merge `hermes_coder` into `hermes-coder` from the Namespaces page at console.supermemory.ai after your first save on 1.0.2.
+To keep those memories, either set the old name in the panel or `supermemory/config.json` (`"namespace": "hermes_coder"`), or have an org admin merge `hermes_coder` into `hermes-coder` from the Namespaces page at console.supermemory.ai after your first save on 1.0.2.
 
 ### Environment Variables
 
@@ -109,7 +109,7 @@ To keep those memories, either set the old name in the panel or `supermemory/con
 |----------|-------------|
 | `SUPERMEMORY_API_KEY` | API key. Optional when signed in with OAuth; takes priority over the sign-in when set |
 | `SUPERMEMORY_BASE_URL` | Compatibility fallback for the API endpoint when `base_url` is not configured |
-| `SUPERMEMORY_CONTAINER_TAG` | Override the container tag / namespace (takes priority over config file) |
+| `SUPERMEMORY_NAMESPACE` | Override the namespace (takes priority over config file). 1.x's `SUPERMEMORY_CONTAINER_TAG` still works |
 
 Base URL precedence is `supermemory.json` → `SUPERMEMORY_BASE_URL` →
 `https://api.supermemory.ai`. Hermes resolves it once and uses the same endpoint
@@ -149,40 +149,40 @@ When enabled, Hermes can:
 - expose explicit tools for search, store, forget, profile, and reading documents
 
 
-## Profile-Scoped Containers
+## Profile-Scoped Namespaces
 
-Use `{identity}` in the `container_tag` to scope memories per Hermes profile:
+Use `{identity}` in the `namespace` to scope memories per Hermes profile:
 
 ```json
 {
-  "container_tag": "hermes-{identity}"
+  "namespace": "hermes-{identity}"
 }
 ```
 
-For a profile named `coder`, this resolves to `hermes-coder`. The default profile resolves to `hermes-default`. Without `{identity}`, all profiles share the same container.
+For a profile named `coder`, this resolves to `hermes-coder`. The default profile resolves to `hermes-default`. Without `{identity}`, all profiles share the same namespace.
 
-## Multi-Container Mode
+## Multi-Namespace Mode
 
-For advanced setups (e.g. OpenClaw-style multi-workspace), you can enable custom container tags so the agent can read/write across multiple named containers:
+For advanced setups (e.g. OpenClaw-style multi-workspace), you can enable custom namespaces so the agent can read/write across multiple named namespaces:
 
 ```json
 {
-  "container_tag": "hermes",
-  "enable_custom_container_tags": true,
-  "custom_containers": ["project-alpha", "project-beta", "shared-knowledge"],
-  "custom_container_instructions": "Use project-alpha for coding tasks, project-beta for research, and shared-knowledge for team-wide facts."
+  "namespace": "hermes",
+  "enable_custom_namespaces": true,
+  "custom_namespaces": ["project-alpha", "project-beta", "shared-knowledge"],
+  "custom_namespace_instructions": "Use project-alpha for coding tasks, project-beta for research, and shared-knowledge for team-wide facts."
 }
 ```
 
 When enabled:
-- every tool accepts an optional `container_tag` parameter (each container is its own namespace)
-- The tag must be in the whitelist: primary container + `custom_containers`
-- Automatic operations (turn capture, prefetch, memory write mirroring) always use the **primary** container only
-- Custom container instructions are injected into the system prompt
+- every tool accepts an optional `namespace` parameter
+- The namespace must be in the whitelist: primary namespace + `custom_namespaces`
+- Automatic operations (turn capture, prefetch, memory write mirroring) always use the **primary** namespace only
+- Custom namespace instructions are injected into the system prompt
 
 ## Upgrading from 1.x
 
-- Your memories stay searchable under the same `container_tag`. Nothing needs migrating.
+- 1.x called namespaces container tags. `container_tag`, `enable_custom_container_tags`, `custom_containers`, `custom_container_instructions` and `SUPERMEMORY_CONTAINER_TAG` still work, and your memories stay searchable under the same name. Nothing needs migrating.
 - New conversations are saved as one document each instead of one per 4-hour window. A conversation that was open during the upgrade keeps its earlier turns where 1.x saved them, and only new turns go into the new document.
 - `search_mode: documents` is now called `chunks`; the old value still works.
 

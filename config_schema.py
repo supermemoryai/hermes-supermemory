@@ -26,8 +26,8 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             inline=True,
         ),
         ProviderField(
-            key="container_tag",
-            label="Container tag",
+            key="namespace",
+            label="Namespace",
             kind=KIND_TEXT,
             placeholder="hermes",
             description="Where memories are stored. {identity} becomes the Hermes profile name.",
@@ -38,7 +38,7 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             label="Gateway memory scope",
             kind=KIND_SELECT,
             default="user",
-            description="For gateway bots. CLI and Desktop always use the container tag.",
+            description="For gateway bots. CLI and Desktop always use the namespace.",
             options=(
                 ProviderFieldOption("user", "Per user", "Each person gets their own memory"),
                 ProviderFieldOption("chat", "Per chat", "Each conversation gets its own memory"),

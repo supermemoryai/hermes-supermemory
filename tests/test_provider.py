@@ -192,10 +192,10 @@ def test_a_self_hosted_base_url_still_needs_an_api_key(api, monkeypatch, tmp_pat
 
 def test_config_file_and_normalization(tmp_path):
     (tmp_path / "supermemory.json").write_text(json.dumps(
-        {"container_tag": "hermes-{identity}", "max_recall_results": 50, "search_mode": "documents", "dreaming": "Instant"}))
+        {"namespace": "hermes-{identity}", "max_recall_results": 50, "search_mode": "documents", "dreaming": "Instant"}))
     config = sm._load_supermemory_config(str(tmp_path))
     assert (config["max_recall_results"], config["search_mode"], config["dreaming"]) == (20, "chunks", "instant")
-    assert sm._sanitize_tag(sm._expand_container_tag(config["container_tag"], "coder")) == "hermes-coder"
+    assert sm._sanitize_namespace(sm._expand_namespace(config["namespace"], "coder")) == "hermes-coder"
     assert sm._load_supermemory_config(None)["dreaming"] == "dynamic"
     assert sm._load_supermemory_config(None)["profile_frequency"] == 50
 
@@ -382,14 +382,40 @@ def test_failed_mirror_delete_is_retried(api, tmp_path):
     assert api.docs == {}
 
 
-def test_custom_containers_are_namespaces(api, tmp_path):
+def test_custom_namespaces_are_allowed_by_name(api, tmp_path):
     (tmp_path / "supermemory.json").write_text(json.dumps(
-        {"enable_custom_container_tags": True, "custom_containers": ["project-alpha"]}))
+        {"enable_custom_namespaces": True, "custom_namespaces": ["project-alpha"]}))
     provider = make_provider(tmp_path)
-    provider.handle_tool_call("supermemory_search", {"query": "x", "container_tag": "project-alpha"})
+    provider.handle_tool_call("supermemory_search", {"query": "x", "namespace": "project-alpha"})
     assert api.requests[-1]["path"] == "/ns/project-alpha/search"
-    refused = json.loads(provider.handle_tool_call("supermemory_search", {"query": "x", "container_tag": "other"}))
+    refused = json.loads(provider.handle_tool_call("supermemory_search", {"query": "x", "namespace": "other"}))
     assert "not allowed" in refused["error"]
+
+
+def test_1x_container_tag_keys_still_set_the_namespaces(api, tmp_path):
+    (tmp_path / "supermemory.json").write_text(json.dumps(
+        {"container_tag": "team-bot", "enable_custom_container_tags": True, "custom_containers": ["project-alpha"]}))
+    provider = make_provider(tmp_path)
+    provider.handle_tool_call("supermemory_search", {"query": "x"})
+    provider.handle_tool_call("supermemory_search", {"query": "x", "namespace": "project-alpha"})
+    assert [r["path"] for r in api.requests[-2:]] == ["/ns/team-bot/search", "/ns/project-alpha/search"]
+
+
+def test_the_namespace_key_wins_over_container_tag_in_the_same_file(api, tmp_path):
+    (tmp_path / "supermemory.json").write_text(json.dumps({"container_tag": "old", "namespace": "new"}))
+    assert sm._load_supermemory_config(str(tmp_path))["namespace"] == "new"
+
+
+@pytest.mark.parametrize("env, namespace", [
+    ({"SUPERMEMORY_CONTAINER_TAG": "from-1x"}, "from-1x"),
+    ({"SUPERMEMORY_CONTAINER_TAG": "from-1x", "SUPERMEMORY_NAMESPACE": "from-env"}, "from-env"),
+], ids=["1x-env", "namespace-env-wins"])
+def test_the_namespace_env_var_overrides_the_config(api, tmp_path, monkeypatch, env, namespace):
+    real = sm.get_secret
+    monkeypatch.setattr(sm, "get_secret", lambda name, default=None: env.get(name) or real(name, default))
+    (tmp_path / "supermemory.json").write_text(json.dumps({"namespace": "from-config"}))
+    make_provider(tmp_path).handle_tool_call("supermemory_search", {"query": "x"})
+    assert api.requests[-1]["path"] == f"/ns/{namespace}/search"
 
 
 def test_dreaming_can_be_instant(api, tmp_path):
@@ -423,9 +449,9 @@ def test_memory_manager_dispatch(api, tmp_path):
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits not enforced on Windows")
 def test_save_config_sets_owner_only_permissions(tmp_path):
-    SupermemoryMemoryProvider().save_config({"container_tag": "my tag"}, str(tmp_path))
+    SupermemoryMemoryProvider().save_config({"namespace": "my namespace"}, str(tmp_path))
     path = tmp_path / "supermemory.json"
-    assert json.loads(path.read_text())["container_tag"] == "my_tag"
+    assert json.loads(path.read_text())["namespace"] == "my_namespace"
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
@@ -545,8 +571,8 @@ def test_profile_is_recalled_on_the_first_turn_and_every_profile_frequency_turns
     ("my.project", "my_project"),
     ("x" * 120, "x" * 91 + "_" + sm.hashlib.sha256(("x" * 120).encode()).hexdigest()[:8]),
 ], ids=["hyphen", "colon", "dot", "over-100"])
-def test_container_tags_reach_v5_as_namespaces(api, tmp_path, raw, namespace):
-    (tmp_path / "supermemory.json").write_text(json.dumps({"container_tag": raw}))
+def test_namespaces_reach_v5_in_the_api_charset(api, tmp_path, raw, namespace):
+    (tmp_path / "supermemory.json").write_text(json.dumps({"namespace": raw}))
     provider = make_provider(tmp_path)
     provider.handle_tool_call("supermemory_search", {"query": "q"})
     provider.prefetch("q")
@@ -555,7 +581,7 @@ def test_container_tags_reach_v5_as_namespaces(api, tmp_path, raw, namespace):
     assert len(namespace) <= 100 and sm.re.fullmatch(r"[a-zA-Z0-9_:-]+", namespace)
 
 
-def test_legacy_tag_warning_still_fires_once(api, tmp_path, caplog):
+def test_legacy_namespace_warning_still_fires_once(api, tmp_path, caplog):
     (tmp_path / "supermemory.json").write_text(json.dumps({"container_tag": "hermes-{identity}"}))
     make_provider(tmp_path, agent_identity="coder")
     make_provider(tmp_path, agent_identity="coder")
@@ -606,14 +632,14 @@ def test_a_first_setup_defaults_to_the_user_scope(api, tmp_path, monkeypatch):
     assert sm._load_supermemory_config(str(tmp_path))["memory_scope"] == "user"
 
 
-def test_rerunning_setup_keeps_an_existing_bot_on_the_shared_container(api, tmp_path, monkeypatch):
+def test_rerunning_setup_keeps_an_existing_bot_on_the_shared_namespace(api, tmp_path, monkeypatch):
     import hermes_cli.config
     import hermes_cli.memory_setup
 
     monkeypatch.setattr(hermes_cli.config, "save_config", lambda config: None)
     monkeypatch.setattr(hermes_cli.memory_setup, "_prompt", lambda *a, **k: "")
     monkeypatch.setattr(sm, "get_secret", lambda name, default=None: "scoped-key")
-    (tmp_path / "supermemory.json").write_text(json.dumps({"container_tag": "team-bot"}))
+    (tmp_path / "supermemory.json").write_text(json.dumps({"namespace": "team-bot"}))
     SupermemoryMemoryProvider().post_setup(str(tmp_path), {})
     assert sm._load_supermemory_config(str(tmp_path))["memory_scope"] == "shared"
     (tmp_path / "supermemory.json").unlink()
@@ -633,7 +659,7 @@ def test_a_sign_in_from_another_home_does_not_count_as_a_prior_setup(api, issuer
     assert sm._load_supermemory_config(str(tmp_path))["memory_scope"] == "user"
 
 
-def test_rerunning_setup_keeps_an_active_signed_in_bot_on_the_shared_container(api, issuer, tmp_path, monkeypatch):
+def test_rerunning_setup_keeps_an_active_signed_in_bot_on_the_shared_namespace(api, issuer, tmp_path, monkeypatch):
     import hermes_cli.config
     import hermes_cli.memory_setup
 
@@ -702,8 +728,8 @@ def namespaces(api):
     return {r["path"].split("/")[2] for r in api.requests}
 
 
-def test_existing_config_without_scope_stays_shared_and_tags_writes(api, tmp_path):
-    (tmp_path / "supermemory.json").write_text(json.dumps({"container_tag": "hermes"}))
+def test_existing_config_without_scope_stays_shared_and_ids_writes(api, tmp_path):
+    (tmp_path / "supermemory.json").write_text(json.dumps({"namespace": "hermes"}))
     provider = make_provider(tmp_path, **GATEWAY)
     provider.prefetch("Book the usual table")
     provider.sync_turn("Book the usual table", "Booked.", messages=transcript(("Book the usual table", "Booked.")))
@@ -718,7 +744,7 @@ def test_existing_config_without_scope_stays_shared_and_tags_writes(api, tmp_pat
     ("user", {}, "hermes"),
     ("chat", {"platform": "telegram", "user_id": "42"}, "hermes"),
 ], ids=["user", "chat", "user-on-cli", "chat-without-chat-id"])
-def test_scope_picks_the_container(api, tmp_path, value, ids, namespace):
+def test_scope_picks_the_namespace(api, tmp_path, value, ids, namespace):
     scope(tmp_path, value)
     provider = make_provider(tmp_path, **ids)
     provider.prefetch("Book the usual table")
@@ -728,7 +754,7 @@ def test_scope_picks_the_container(api, tmp_path, value, ids, namespace):
 
 
 def test_scoped_names_are_platform_qualified_and_valid(api, tmp_path):
-    names = {sm._scoped_tag("hermes", "user", platform, uid, "")
+    names = {sm._scoped_namespace("hermes", "user", platform, uid, "")
              for platform, uid in (("telegram", "42"), ("discord", "42"), ("matrix", "@a:b.org"), ("matrix", "@a:b_org"),
                                    ("slack", "U" * 200))}
     assert len(names) == 5
@@ -893,9 +919,9 @@ def test_no_module_level_mutable_state():
 
 
 @pytest.mark.parametrize("legacy, panel, expected", [
-    ({"container_tag": "old", "auto_capture": False}, None, ("old", False)),
-    (None, {"container_tag": "panel", "auto_capture": False}, ("panel", False)),
-    ({"container_tag": "old", "auto_capture": False}, {"container_tag": "panel", "auto_capture": True}, ("panel", True)),
+    ({"namespace": "old", "auto_capture": False}, None, ("old", False)),
+    (None, {"namespace": "panel", "auto_capture": False}, ("panel", False)),
+    ({"namespace": "old", "auto_capture": False}, {"namespace": "panel", "auto_capture": True}, ("panel", True)),
 ], ids=["supermemory.json", "panel", "panel-wins"])
 def test_both_config_files_are_read(tmp_path, legacy, panel, expected):
     if legacy:
@@ -904,7 +930,7 @@ def test_both_config_files_are_read(tmp_path, legacy, panel, expected):
         (tmp_path / "supermemory").mkdir()
         (tmp_path / "supermemory" / "config.json").write_text(json.dumps(panel))
     config = sm._load_supermemory_config(str(tmp_path))
-    assert (config["container_tag"], config["auto_capture"]) == expected
+    assert (config["namespace"], config["auto_capture"]) == expected
 
 
 def test_setup_after_the_panel_takes_effect(tmp_path):
@@ -934,7 +960,7 @@ def test_panel_schema_loads_and_saves_through_the_hermes_dashboard(tmp_path, mon
     monkeypatch.setattr(memory_providers, "save_config", lambda config: None)
     memory_providers._update_memory_provider_config(schema, {f["key"]: f["value"] for f in payload["fields"]})
     config = sm._load_supermemory_config(str(tmp_path))
-    assert (config["memory_scope"], config["container_tag"], config["threshold"]) == ("user", "hermes", None)
+    assert (config["memory_scope"], config["namespace"], config["threshold"]) == ("user", "hermes", None)
     panel_keys = {f.key for f in schema.fields} - {"api_key"}
     assert panel_keys == set(sm._PANEL_KEYS)
 
@@ -962,14 +988,14 @@ def test_first_run_copies_supermemory_json_into_the_panel_file(api, tmp_path):
     (tmp_path / "supermemory.json").write_text(json.dumps(legacy))
     make_provider(tmp_path)
     panel = tmp_path / "supermemory" / "config.json"
-    assert json.loads(panel.read_text()) == {"container_tag": "old", "auto_capture": False, "threshold": 0.4, "memory_scope": "shared"}
+    assert json.loads(panel.read_text()) == {"namespace": "old", "auto_capture": False, "threshold": 0.4, "memory_scope": "shared"}
     assert json.loads((tmp_path / "supermemory.json").read_text()) == legacy
     assert stat.S_IMODE(panel.stat().st_mode) == 0o600
     panel.write_text(json.dumps({"memory_scope": "user"}))
     make_provider(tmp_path)
     assert json.loads(panel.read_text()) == {"memory_scope": "user"}
     config = sm._load_supermemory_config(str(tmp_path))
-    assert (config["memory_scope"], config["container_tag"], config["entity_context"]) == ("user", "old", "Only names.")
+    assert (config["memory_scope"], config["namespace"], config["entity_context"]) == ("user", "old", "Only names.")
 
 
 def test_first_run_keeps_a_chosen_scope_and_skips_fresh_installs(api, tmp_path):
@@ -1008,7 +1034,7 @@ def test_group_rewind_drops_stored_turns_the_transcript_no_longer_has(api, tmp_p
     assert api.captures()[mine] == TURN1 + "\n\n" + turn9
 
 
-def test_legacy_tag_warning_names_the_file_that_wins(api, tmp_path, caplog):
+def test_legacy_namespace_warning_names_the_file_that_wins(api, tmp_path, caplog):
     (tmp_path / "supermemory.json").write_text(json.dumps({"container_tag": "hermes-{identity}"}))
     make_provider(tmp_path, agent_identity="coder")
     assert "set the old name in supermemory/config.json" in caplog.text
