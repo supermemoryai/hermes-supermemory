@@ -489,9 +489,9 @@ def _probe_supermemory_connection(api_key: str, hermes_home: str, *, identity: s
     return {**status, "ok": True, "profile_facts": facts, "auth": "oauth" if oauth else "api_key"}
 
 
-# Bots from before 2.0 always had an API key, so a key or a config file means this home's memory scope is left alone.
-def _has_prior_setup(api_key: str, hermes_home: str) -> bool:
-    return bool(api_key) or any(path.exists() for path in (Path(hermes_home) / "supermemory" / "config.json", Path(hermes_home) / "supermemory.json"))
+# A key, a config file or this home already running supermemory means its memory scope is left alone.
+def _has_prior_setup(api_key: str, hermes_home: str, was_active: bool) -> bool:
+    return bool(api_key) or was_active or any(path.exists() for path in (Path(hermes_home) / "supermemory" / "config.json", Path(hermes_home) / "supermemory.json"))
 
 
 def _sign_in_interactively(base_url: str) -> None:
@@ -614,9 +614,10 @@ class SupermemoryMemoryProvider(MemoryProvider):
                   f"  or paste an API key from {_API_KEY_URL}\n")
             val = _prompt("Supermemory API key (blank to sign in with your browser)", secret=True)
         memory = config["memory"] = config["memory"] if isinstance(config.get("memory"), dict) else {}
+        was_active = memory.get("provider") == self.name
         memory["provider"] = self.name
         save_config(config)
-        if not _has_prior_setup(existing, hermes_home):
+        if not _has_prior_setup(existing, hermes_home, was_active):
             _save_supermemory_config({"memory_scope": "user"}, hermes_home)
         if val:
             _write_env_vars({"SUPERMEMORY_API_KEY": val}, hermes_home=hermes_home)
