@@ -195,7 +195,7 @@ def test_config_file_and_normalization(tmp_path):
         {"namespace": "hermes-{identity}", "max_recall_results": 50, "search_mode": "documents", "dreaming": "Instant"}))
     config = sm._load_supermemory_config(str(tmp_path))
     assert (config["max_recall_results"], config["search_mode"], config["dreaming"]) == (20, "chunks", "instant")
-    assert sm._sanitize_namespace(sm._expand_namespace(config["namespace"], "coder")) == "hermes-coder"
+    assert sm._expand_namespace(config, "coder") == "hermes-coder"
     assert sm._load_supermemory_config(None)["dreaming"] == "dynamic"
     assert sm._load_supermemory_config(None)["profile_frequency"] == 50
 
@@ -394,13 +394,13 @@ def test_custom_namespaces_are_allowed_by_name(api, tmp_path):
 
 def test_1x_container_tag_keys_still_set_the_namespaces(api, tmp_path):
     (tmp_path / "supermemory.json").write_text(json.dumps(
-        {"container_tag": "team-bot", "enable_custom_container_tags": True, "custom_containers": ["project-alpha"]}))
+        {"container_tag": "team_bot", "enable_custom_container_tags": True, "custom_containers": ["project_alpha"]}))
     provider = make_provider(tmp_path)
     provider.handle_tool_call("supermemory_search", {"query": "x"})
     provider.handle_tool_call("supermemory_search", {"query": "x", "namespace": "project-alpha"})
-    assert [r["path"] for r in api.requests[-2:]] == ["/ns/team-bot/search", "/ns/project-alpha/search"]
-    provider.handle_tool_call("supermemory_search", {"query": "x", "container_tag": "project-alpha"})
-    assert api.requests[-1]["path"] == "/ns/project-alpha/search"
+    assert [r["path"] for r in api.requests[-2:]] == ["/ns/team_bot/search", "/ns/project_alpha/search"]
+    provider.handle_tool_call("supermemory_search", {"query": "x", "container_tag": "project_alpha"})
+    assert api.requests[-1]["path"] == "/ns/project_alpha/search"
     refused = json.loads(provider.handle_tool_call("supermemory_search", {"query": "x", "container_tag": "other"}))
     assert "not allowed" in refused["error"]
 
@@ -411,7 +411,7 @@ def test_the_namespace_key_wins_over_container_tag_in_the_same_file(api, tmp_pat
 
 
 @pytest.mark.parametrize("env, namespace", [
-    ({"SUPERMEMORY_CONTAINER_TAG": "from-1x"}, "from-1x"),
+    ({"SUPERMEMORY_CONTAINER_TAG": "from-1x"}, "from_1x"),
     ({"SUPERMEMORY_CONTAINER_TAG": "from-1x", "SUPERMEMORY_NAMESPACE": "from-env"}, "from-env"),
 ], ids=["1x-env", "namespace-env-wins"])
 def test_the_namespace_env_var_overrides_the_config(api, tmp_path, monkeypatch, env, namespace):
@@ -585,11 +585,32 @@ def test_namespaces_reach_v5_in_the_api_charset(api, tmp_path, raw, namespace):
     assert len(namespace) <= 100 and sm.re.fullmatch(r"[a-zA-Z0-9_:-]+", namespace)
 
 
-def test_legacy_namespace_warning_still_fires_once(api, tmp_path, caplog):
-    (tmp_path / "supermemory.json").write_text(json.dumps({"container_tag": "hermes-{identity}"}))
-    make_provider(tmp_path, agent_identity="coder")
-    make_provider(tmp_path, agent_identity="coder")
-    assert caplog.text.count("hermes_coder -> hermes-coder") == 1
+def test_a_1x_container_tag_keeps_the_101_spelling(api, tmp_path):
+    (tmp_path / "supermemory.json").write_text(json.dumps(
+        {"container_tag": "hermes-{identity}", "enable_custom_container_tags": True, "custom_containers": ["project-alpha"]}))
+    provider = make_provider(tmp_path, agent_identity="coder")
+    assert json.loads((tmp_path / "supermemory" / "config.json").read_text())["namespace"] == "hermes_coder"
+    provider.handle_tool_call("supermemory_search", {"query": "x"})
+    provider.handle_tool_call("supermemory_search", {"query": "x", "namespace": "project-alpha"})
+    provider.handle_tool_call("supermemory_search", {"query": "x", "container_tag": "project_alpha"})
+    provider.sync_turn("Book the usual table", "Booked.", messages=transcript(("Book the usual table", "Booked.")))
+    assert {r["path"].split("/")[2] for r in api.requests} == {"hermes_coder", "project_alpha"}
+    assert make_provider(tmp_path, agent_identity="coder")._namespace == "hermes_coder"
+
+
+def test_the_namespace_key_keeps_hyphens_and_colons(api, tmp_path):
+    (tmp_path / "supermemory.json").write_text(json.dumps(
+        {"namespace": "hermes-{identity}", "enable_custom_namespaces": True, "custom_namespaces": ["team:alpha"]}))
+    provider = make_provider(tmp_path, agent_identity="coder")
+    provider.handle_tool_call("supermemory_search", {"query": "x", "namespace": "team:alpha"})
+    assert provider._namespace == "hermes-coder" and api.requests[-1]["path"] == "/ns/team:alpha/search"
+    assert json.loads((tmp_path / "supermemory" / "config.json").read_text())["namespace"] == "hermes-{identity}"
+
+
+def test_a_name_1x_never_rewrote_keeps_its_template_in_the_panel(api, tmp_path):
+    (tmp_path / "supermemory.json").write_text(json.dumps({"container_tag": "team_{identity}"}))
+    assert make_provider(tmp_path, agent_identity="coder")._namespace == "team_coder"
+    assert json.loads((tmp_path / "supermemory" / "config.json").read_text())["namespace"] == "team_{identity}"
 
 
 def test_long_session_ids_keep_document_ids_within_100_characters(api, tmp_path):
@@ -1038,10 +1059,11 @@ def test_group_rewind_drops_stored_turns_the_transcript_no_longer_has(api, tmp_p
     assert api.captures()[mine] == TURN1 + "\n\n" + turn9
 
 
-def test_legacy_namespace_warning_names_the_file_that_wins(api, tmp_path, caplog):
-    (tmp_path / "supermemory.json").write_text(json.dumps({"container_tag": "hermes-{identity}"}))
-    make_provider(tmp_path, agent_identity="coder")
-    assert "set the old name in supermemory/config.json" in caplog.text
+def test_the_panel_namespace_overrides_a_1x_container_tag(api, tmp_path):
+    (tmp_path / "supermemory.json").write_text(json.dumps({"container_tag": "old-name"}))
+    (tmp_path / "supermemory").mkdir()
+    (tmp_path / "supermemory" / "config.json").write_text(json.dumps({"namespace": "new-name"}))
+    assert make_provider(tmp_path)._namespace == "new-name"
 
 
 

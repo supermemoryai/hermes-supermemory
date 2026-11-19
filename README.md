@@ -99,9 +99,7 @@ Existing bots keep `shared`, so every user shares one namespace. To switch, choo
 
 ### Upgrading from 1.0.1
 
-1.0.1 changed `-` and `:` in container tags to `_`, so `hermes-coder` was saved as `hermes_coder`. From 1.0.2 names are kept as written, so memories saved before the upgrade stay under the old name. The plugin logs the old and new name once.
-
-To keep those memories, either set the old name in the panel or `supermemory/config.json` (`"namespace": "hermes_coder"`), or have an org admin merge `hermes_coder` into `hermes-coder` from the Namespaces page at console.supermemory.ai after your first save on 1.0.2.
+1.0.1 changed `-` and `:` in container tags to `_`, so `hermes-coder` was saved as `hermes_coder`. Names set with the 1.x keys (`container_tag`, `custom_containers`, `SUPERMEMORY_CONTAINER_TAG`) keep that spelling, so memories stay where they are, and the panel shows the saved name (for example `hermes_coder`). Names set with `namespace`, `custom_namespaces` or `SUPERMEMORY_NAMESPACE` are kept as written.
 
 ### Environment Variables
 

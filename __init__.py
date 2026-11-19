@@ -89,7 +89,7 @@ def _sanitize_namespace(raw: str) -> str:
     return _cap_namespace("_".join(part for part in re.split(r"[^a-zA-Z0-9_:-]+", raw or "") if part) or _DEFAULT_NAMESPACE)
 
 
-# The 1.0.1 sanitizer, kept only to name the namespace that version wrote to.
+# The 1.0.1 sanitizer: names from 1.x keys keep its spelling.
 def _legacy_namespace(raw: str) -> str:
     return re.sub(r"_+", "_", re.sub(r"[^a-zA-Z0-9_]", "_", raw or "")).strip("_") or _DEFAULT_NAMESPACE
 
@@ -167,10 +167,17 @@ _LEGACY_CONFIG_KEYS = (("container_tag", "namespace"), ("enable_custom_container
                        ("custom_containers", "custom_namespaces"), ("custom_container_instructions", "custom_namespace_instructions"))
 
 
+# _1x_namespace / _1x_custom_namespaces record that the name came from a 1.x key, so it keeps 1.0.1's spelling.
 def _read_config_file(path: Path) -> dict:
     raw = _read_json_dict(path)
-    renamed = {new: raw.pop(old) for old, new in _LEGACY_CONFIG_KEYS if old in raw}
-    return {**renamed, **raw}
+    merged = {**{new: raw.pop(old) for old, new in _LEGACY_CONFIG_KEYS if old in raw}, **raw}
+    return {**merged, **{f"_1x_{key}": key not in raw for key in ("namespace", "custom_namespaces") if merged.get(key) is not None}}
+
+
+# 1.0.1 saved memories under its rewritten name, so a name from a 1.x key keeps that spelling and its memories.
+def _resolve_namespace(raw: str, from_1x: bool) -> str:
+    legacy = _legacy_namespace(raw)
+    return legacy if from_1x and len(legacy) <= _MAX_NAMESPACE_LEN else _sanitize_namespace(raw)
 
 
 def _load_supermemory_config(hermes_home: Optional[str] = None) -> dict:
@@ -184,15 +191,18 @@ def _load_supermemory_config(hermes_home: Optional[str] = None) -> dict:
 
 
 # The panel reads only its own file, so an existing supermemory.json is copied there once and the panel shows real values.
-def _seed_panel_config(hermes_home: str) -> None:
+def _seed_panel_config(hermes_home: str, identity: str) -> None:
     from utils import atomic_json_write
     legacy_path, panel_path = Path(hermes_home) / "supermemory.json", Path(hermes_home) / "supermemory" / "config.json"
     if panel_path.exists() or not legacy_path.exists():
         return
     legacy = _read_config_file(legacy_path)
+    seeded = {"memory_scope": "shared", **{k: legacy[k] for k in _PANEL_KEYS if legacy.get(k) is not None}}
+    expanded = str(legacy.get("namespace") or "").strip().replace("{identity}", identity)
+    if legacy.get("_1x_namespace") and expanded and _resolve_namespace(expanded, True) != _sanitize_namespace(expanded):
+        seeded["namespace"] = _resolve_namespace(expanded, True)
     panel_path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_json_write(panel_path, {"memory_scope": "shared", **{k: legacy[k] for k in _PANEL_KEYS if legacy.get(k) is not None}},
-                      mode=0o600, sort_keys=True)
+    atomic_json_write(panel_path, seeded, mode=0o600, sort_keys=True)
 
 
 # Once the config panel's file exists it wins, so setup writes there too or its choice would be shadowed.
@@ -474,15 +484,16 @@ def _build_client(api_key: str, config: dict, namespace: str, oauth: Optional[di
                               search_mode=config["search_mode"], base_url=_resolve_base_url(config["base_url"]), oauth=oauth)
 
 
-def _expand_namespace(config_namespace: str, identity: str) -> str:
+def _expand_namespace(config: dict, identity: str) -> str:
     """SUPERMEMORY_NAMESPACE, then 1.x's SUPERMEMORY_CONTAINER_TAG (profile-scoped, never the default profile's environ) > config > default, {identity} expanded."""
-    raw_namespace = next((v for name in ("SUPERMEMORY_NAMESPACE", "SUPERMEMORY_CONTAINER_TAG") if (v := (get_secret(name, "") or "").strip())), "") or config_namespace
-    return raw_namespace.replace("{identity}", identity)
+    raw, from_1x = next(((v, name == "SUPERMEMORY_CONTAINER_TAG") for name in ("SUPERMEMORY_NAMESPACE", "SUPERMEMORY_CONTAINER_TAG")
+                         if (v := (get_secret(name, "") or "").strip())), (config["namespace"], bool(config.get("_1x_namespace"))))
+    return _resolve_namespace(raw.replace("{identity}", identity), from_1x)
 
 
 def _probe_supermemory_connection(api_key: str, hermes_home: str, *, identity: str = "default") -> dict:
     config = _load_supermemory_config(hermes_home)
-    status = {"ok": False, "error": "", "profile_facts": 0, "namespace": _sanitize_namespace(_expand_namespace(config["namespace"], identity)),
+    status = {"ok": False, "error": "", "profile_facts": 0, "namespace": _expand_namespace(config, identity),
               "auto_recall": bool(config["auto_recall"]), "auto_capture": bool(config["auto_capture"])}
     api_key = (api_key or "").strip()
     oauth = None if api_key else _signed_in(_resolve_base_url(config["base_url"]))
@@ -578,7 +589,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
                     "include_related", "include_forgotten", "allow_agent_search_overrides", "profile_frequency",
                     "search_mode", "entity_context", "dreaming", "api_timeout", "custom_namespace_instructions"):
             setattr(self, f"_{key}", config[key])
-        self._custom_namespaces = [_sanitize_namespace(t) for t in config["custom_namespaces"]]
+        self._custom_namespaces = [_resolve_namespace(t, bool(config.get("_1x_custom_namespaces"))) for t in config["custom_namespaces"]]
         self._base_url, self._enable_custom_namespaces = _resolve_base_url(config["base_url"]), config["enable_custom_namespaces"]
         self._allowed_namespaces: List[str] = [self._namespace] + list(self._custom_namespaces)
 
@@ -645,11 +656,11 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._hermes_home = kwargs.get("hermes_home") or str(get_hermes_home())
         self._session_id, self._turn_count, self._pending = session_id, 0, {}
         self._reset_capture(session_id)
-        _quietly(lambda: _seed_panel_config(self._hermes_home), "Failed to copy supermemory.json into the config panel's file", level=logging.WARNING)
+        identity = kwargs.get("agent_identity", "default")
+        _quietly(lambda: _seed_panel_config(self._hermes_home, identity), "Failed to copy supermemory.json into the config panel's file", level=logging.WARNING)
         config = _load_supermemory_config(self._hermes_home)
         self._api_key = get_secret("SUPERMEMORY_API_KEY", "") or ""
-        raw_namespace = _expand_namespace(config["namespace"], kwargs.get("agent_identity", "default"))
-        self._base_namespace = _sanitize_namespace(raw_namespace)
+        self._base_namespace = _expand_namespace(config, identity)
         self._platform, self._user_id, self._chat_id = (str(kwargs.get(k) or "").strip() for k in ("platform", "user_id", "chat_id"))
         self._speaker, self._pending_forgets, self._recalled_ids = "", [], set()
         self._namespace = _scoped_namespace(self._base_namespace, config["memory_scope"], self._platform, self._user_id, self._chat_id)
@@ -665,21 +676,6 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._profiles, self._profile_jobs, self._profile_shown, self._last_recall = {}, {}, set(), None
         if self._active and self._auto_recall:
             self._refresh_profile(self._namespace)
-        if self._active:
-            self._warn_legacy_namespaces_once([raw_namespace] + (config["custom_namespaces"] if self._enable_custom_namespaces else []))
-
-    # Data saved by 1.0.1 sits under its rewritten namespace; a marker file in HERMES_HOME keeps this to one warning per install.
-    def _warn_legacy_namespaces_once(self, raw_namespaces: List[str]) -> None:
-        pairs = {(_legacy_namespace(raw), _sanitize_namespace(raw)) for raw in raw_namespaces}
-        renamed = sorted((old, new) for old, new in pairs if old != new and len(old) <= _MAX_NAMESPACE_LEN)
-        marker = Path(self._hermes_home) / ".supermemory_legacy_tags_warned"
-        if not renamed or marker.exists():
-            return
-        config_file = "supermemory/config.json" if (Path(self._hermes_home) / "supermemory" / "config.json").exists() else "supermemory.json"
-        logger.warning("Memories saved by hermes-supermemory 1.0.1 are under the old namespace (old -> new): %s. To keep them, set the old name "
-                       "in %s, or have an org admin merge it into the new namespace from Namespaces at console.supermemory.ai "
-                       "after your first save.", ", ".join(f"{old} -> {new}" for old, new in renamed), config_file)
-        _quietly(marker.touch, "Failed to write %s", marker)
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         self._turn_count = max(turn_number, 0)
@@ -995,6 +991,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
         """Validated namespace from args (1.x called it container_tag); None = primary. Raises _NamespaceError when not whitelisted."""
         raw = str(args.get("namespace") or args.get("container_tag") or "").strip() if self._enable_custom_namespaces else ""
         namespace = _sanitize_namespace(raw) if raw else None
+        if namespace and namespace not in self._allowed_namespaces and _legacy_namespace(raw) in self._allowed_namespaces:
+            namespace = _legacy_namespace(raw)
         if namespace and namespace not in self._allowed_namespaces:
             raise _NamespaceError(f"Namespace '{namespace}' is not allowed. Allowed: {', '.join(self._allowed_namespaces)}")
         return namespace
