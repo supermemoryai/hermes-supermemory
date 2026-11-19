@@ -611,7 +611,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         memory = config["memory"] = config["memory"] if isinstance(config.get("memory"), dict) else {}
         memory["provider"] = self.name
         save_config(config)
-        if not any("memory_scope" in _read_json_dict(path) for path in (Path(hermes_home) / "supermemory" / "config.json", Path(hermes_home) / "supermemory.json")):
+        if not any(path.exists() for path in (Path(hermes_home) / "supermemory" / "config.json", Path(hermes_home) / "supermemory.json")):
             _save_supermemory_config({"memory_scope": "user"}, hermes_home)
         if val:
             _write_env_vars({"SUPERMEMORY_API_KEY": val}, hermes_home=hermes_home)
