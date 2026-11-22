@@ -11,7 +11,6 @@ import httpx
 import pytest
 
 import hermes_supermemory as sm
-from conftest import save_sign_in
 from hermes_supermemory import SupermemoryMemoryProvider
 
 supermemory = pytest.importorskip("supermemory")
@@ -109,8 +108,8 @@ def clean_env(monkeypatch):
 def api(monkeypatch, tmp_path):
     fake = FakeAPI()
     real = supermemory.Supermemory
-    monkeypatch.setattr(supermemory, "Supermemory", lambda http_client=None, **options: real(
-        http_client=httpx.Client(transport=httpx.MockTransport(fake), auth=http_client.auth if http_client else None), **options))
+    monkeypatch.setattr(supermemory, "Supermemory", lambda **options: real(
+        http_client=httpx.Client(transport=httpx.MockTransport(fake)), **options))
     monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
     return fake
 
@@ -146,48 +145,6 @@ def test_needs_only_an_api_key(monkeypatch):
     assert SupermemoryMemoryProvider().is_available() is False
     monkeypatch.setenv("SUPERMEMORY_API_KEY", "k")
     assert SupermemoryMemoryProvider().is_available() is True
-
-
-def test_oauth_sign_in_is_used_only_without_an_api_key(api, issuer, monkeypatch, tmp_path):
-    monkeypatch.delenv("SUPERMEMORY_API_KEY")
-    assert SupermemoryMemoryProvider().is_available() is False
-    save_sign_in()
-    assert SupermemoryMemoryProvider().is_available() is True
-    make_provider(tmp_path).handle_tool_call("supermemory_search", {"query": "coffee"})
-    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
-    make_provider(tmp_path).handle_tool_call("supermemory_search", {"query": "coffee"})
-    assert [r["headers"]["authorization"] for r in api.requests if r["path"].endswith("/search")] == ["Bearer access-0", "Bearer test-key"]
-    assert issuer.calls == []
-
-
-def test_a_401_refreshes_the_oauth_token_once_and_retries(api, issuer, monkeypatch, tmp_path):
-    monkeypatch.delenv("SUPERMEMORY_API_KEY")
-    save_sign_in()
-    api.failures.append(("/search", 401))
-    result = json.loads(make_provider(tmp_path).handle_tool_call("supermemory_search", {"query": "coffee"}))
-    assert result["count"] == 1
-    assert [r["headers"]["authorization"] for r in api.requests if r["path"].endswith("/search")] == ["Bearer access-0", "Bearer access-1"]
-    assert sm._auth.load_credentials()["refreshToken"] == "refresh-1"
-
-
-def test_an_expired_sign_in_reports_how_to_sign_in_again(api, issuer, monkeypatch, tmp_path):
-    monkeypatch.delenv("SUPERMEMORY_API_KEY")
-    save_sign_in()
-    provider = make_provider(tmp_path)
-    save_sign_in(expires_in_ms=0)
-    issuer.refresh_error = "invalid_grant"
-    assert "auth.py login" in json.loads(provider.handle_tool_call("supermemory_search", {"query": "coffee"}))["error"]
-    assert not [r for r in api.requests if r["path"].endswith("/search")] and SupermemoryMemoryProvider().is_available() is False
-
-
-def test_a_self_hosted_base_url_still_needs_an_api_key(api, monkeypatch, tmp_path):
-    save_sign_in()
-    monkeypatch.setenv("SUPERMEMORY_BASE_URL", "http://localhost:6767")
-    monkeypatch.delenv("SUPERMEMORY_API_KEY")
-    assert SupermemoryMemoryProvider().is_available() is False
-    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
-    make_provider(tmp_path).handle_tool_call("supermemory_search", {"query": "coffee"})
-    assert api.requests[0]["headers"]["authorization"] == "Bearer test-key"
 
 
 def test_config_file_and_normalization(tmp_path):
@@ -673,26 +630,13 @@ def test_rerunning_setup_keeps_an_existing_bot_on_the_shared_namespace(api, tmp_
     assert sm._load_supermemory_config(str(tmp_path))["memory_scope"] == "shared"
 
 
-def test_a_sign_in_from_another_home_does_not_count_as_a_prior_setup(api, issuer, tmp_path, monkeypatch):
+def test_rerunning_setup_keeps_an_active_bot_on_the_shared_namespace(api, tmp_path, monkeypatch):
     import hermes_cli.config
     import hermes_cli.memory_setup
 
     monkeypatch.setattr(hermes_cli.config, "save_config", lambda config: None)
     monkeypatch.setattr(hermes_cli.memory_setup, "_prompt", lambda *a, **k: "")
     monkeypatch.setattr(sm, "get_secret", lambda name, default=None: default)
-    save_sign_in()
-    SupermemoryMemoryProvider().post_setup(str(tmp_path), {"memory": {"provider": ""}})
-    assert sm._load_supermemory_config(str(tmp_path))["memory_scope"] == "user"
-
-
-def test_rerunning_setup_keeps_an_active_signed_in_bot_on_the_shared_namespace(api, issuer, tmp_path, monkeypatch):
-    import hermes_cli.config
-    import hermes_cli.memory_setup
-
-    monkeypatch.setattr(hermes_cli.config, "save_config", lambda config: None)
-    monkeypatch.setattr(hermes_cli.memory_setup, "_prompt", lambda *a, **k: "")
-    monkeypatch.setattr(sm, "get_secret", lambda name, default=None: default)
-    save_sign_in()
     SupermemoryMemoryProvider().post_setup(str(tmp_path), {"memory": {"provider": "supermemory"}})
     assert sm._load_supermemory_config(str(tmp_path))["memory_scope"] == "shared"
 
