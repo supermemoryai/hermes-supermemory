@@ -60,7 +60,7 @@ Config files: `$HERMES_HOME/supermemory.json`, and `$HERMES_HOME/supermemory/con
 | `profile_frequency` | `50` | Include profile facts on the first turn, after a compaction, and every N turns |
 | `search_mode` | `hybrid` | Default mode of the search tool: `hybrid`, `memories` (memories only), `chunks` (document excerpts only; `documents` is accepted as before) |
 | `rerank` | `none` | `order` re-ranks results. The search tool can also ask for `aggregate`, which merges overlapping results |
-| `rewrite_query` | `false` | Rewrite the query before searching (about 400 ms slower) |
+| `rewrite_query` | `false` | Rewrite the query before searching (about 400 ms slower). When off, a search tool call that finds nothing retries once with it on |
 | `include_documents`, `include_related`, `include_forgotten` | `false` | Add each result's source document, related memories, or forgotten memories |
 | `allow_agent_search_overrides` | `true` | Let the search tool pick `search_mode` and `aggregate`; `false` always uses the config |
 | `entity_context` | built-in default | Extraction guidance passed to Supermemory |
