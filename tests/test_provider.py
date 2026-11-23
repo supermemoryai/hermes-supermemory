@@ -866,6 +866,18 @@ def test_locked_search_options_are_hidden_and_ignored(api, tmp_path):
     assert search_bodies(api) == [{"query": "email", "limit": 5, "searchMode": "hybrid"}]
 
 
+def test_an_empty_search_retries_once_with_the_query_rewritten(api, tmp_path):
+    api.results = []
+    provider = make_provider(tmp_path)
+    provider.handle_tool_call("supermemory-search", {"query": "email", "search_mode": "memories"})
+    assert search_bodies(api) == [{"query": "email", "limit": 5, "searchMode": "memories"},
+                                  {"query": "email", "limit": 5, "searchMode": "hybrid", "rewriteQuery": True}]
+    api.requests.clear()
+    (tmp_path / "supermemory.json").write_text(json.dumps({"rewrite_query": True}))
+    make_provider(tmp_path).handle_tool_call("supermemory-search", {"query": "email"})
+    assert search_bodies(api) == [{"query": "email", "limit": 5, "searchMode": "hybrid", "rewriteQuery": True}]
+
+
 def test_recall_dates_come_from_system_updated_at(api, tmp_path):
     api.results = [{"id": "m1", "memory": "Morgan prefers email", "similarity": 0.91, "metadata": {},
                     "system": {"updatedAt": datetime.now().astimezone().isoformat()}}]

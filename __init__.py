@@ -507,7 +507,7 @@ _BASE_SCHEMAS = [
         ("supermemory_store", "Store an explicit memory for future recall.",
          (("content", "string", "The memory content to store."), ("metadata", "object", "Optional metadata attached to the memory.")), ["content"]),
         ("supermemory_search", "Search long-term memory by semantic similarity.",
-         (("query", "string", "What to search for."), ("limit", "integer", "Maximum results to return, 1 to 20.")), ["query"]),
+         (("query", "string", "What to search for, rephrased as the fact or topic you need rather than the user's exact words."), ("limit", "integer", "Maximum results to return, 1 to 20.")), ["query"]),
         ("supermemory_forget", "Forget a memory by exact id or by best-match query.",
          (("id", "string", "Exact memory id to delete."), ("query", "string", "Query used to find the memory to forget.")), None),
         ("supermemory_profile", "Retrieve the user's profile: persistent facts and recent memory context.",
@@ -971,6 +971,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
                                          namespace=self._tool_target(namespace), dreaming=self._dreaming)
         return _with_namespace({"saved": True, "id": result.get("id", ""), "preview": content[:80] + ("..." if len(content) > 80 else "")}, namespace)
 
+    # An empty search retries once with the query rewritten, widening memories to hybrid.
     def _tool_search(self, args: dict) -> dict | str:
         query = str(args.get("query") or "").strip()
         if not query:
@@ -980,12 +981,16 @@ class SupermemoryMemoryProvider(MemoryProvider):
         overrides = self._allow_agent_search_overrides
         mode = _search_mode(args["search_mode"]) if overrides and args.get("search_mode") else None
         rerank = "aggregate" if overrides and _as_bool(args.get("aggregate"), False) else ""
+        options = {**self._search_options(rerank), "limit": limit, "namespace": self._tool_target(namespace)}
+        found = self._client.search_memories(query, search_mode=mode, **options)
+        if not found and not self._rewrite_query:
+            retry_mode = "hybrid" if (mode or self._search_mode) == "memories" else mode
+            found = self._client.search_memories(query, search_mode=retry_mode, **{**options, "rewrite_query": True})
         results = [{"id": i.get("id", ""), "content": i.get("memory", ""),
                     **({"document_id": i["document_id"]} if i.get("document_id") else {}),
                     **({"similarity": pct} if (pct := _similarity_pct(i.get("similarity"))) is not None else {}),
                     **({"related": i["related"]} if i.get("related") else {})}
-                   for i in self._client.search_memories(query, limit=limit, namespace=self._tool_target(namespace), search_mode=mode,
-                                                         **self._search_options(rerank))]
+                   for i in found]
         return _with_namespace({"results": results, "count": len(results)}, namespace)
 
     def _tool_forget(self, args: dict) -> dict | str:
