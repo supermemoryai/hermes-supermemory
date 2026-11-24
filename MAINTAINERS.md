@@ -35,9 +35,10 @@ Dependencies in `pyproject.toml` are installed into the Hermes venv automaticall
 - The in-tree `tools.lazy_deps.ensure("memory.supermemory")` calls were removed: they pinned the exact
   (old) version in Hermes' lazy-deps registry and downgraded newer installs (hermes-agent#86992).
   `pyproject.toml` is now the only dependency authority; bump it when you need a newer client.
-- The setup wizard imports private helpers from `hermes_cli.memory_setup` (`_curses_select`,
-  `_prompt`, ...). Those are Hermes internals, not API; expect to own a copy or drop the wizard
-  hook if they move.
+- `get_config_schema` describes `hermes memory setup` and `config_schema.py` drives the dashboard and
+  Desktop config panel. `post_setup` takes over `hermes memory setup` to prompt for the key and set the
+  memory scope; it uses the private `_prompt` and `_write_env_vars` from `hermes_cli.memory_setup`, which
+  `hermes plugins validate` flags under catalog rule 9, so recheck it on every Hermes release.
 - Tests live in `tests/` and need Hermes Agent importable (install it and this plugin's dependencies into one venv):
   `pip install -e <hermes-agent checkout> 'supermemory>=5.0.0,<6' pytest && python -m pytest tests`. Run them on Python 3.14: Hermes pins its core dependencies only there.
 - While the in-tree copy still exists, a same-named user plugin is shadowed by it
