@@ -12,7 +12,7 @@ import urllib.parse
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from agent.memory_provider import MemoryProvider, RecallStatus
 from agent.secret_scope import get_secret
@@ -100,8 +100,8 @@ def _clamp_entity_context(text: str) -> str:
 
 
 def _as_bool(value: Any, default: bool) -> bool:
-    """bool passthrough; common true/false words parsed; anything else (incl. ints) -> default."""
-    return value if isinstance(value, bool) else _BOOL_WORDS.get(value.strip().lower(), default) if isinstance(value, str) else default
+    """bool and int passthrough; common true/false words parsed; anything else -> default."""
+    return bool(value) if isinstance(value, int) else _BOOL_WORDS.get(value.strip().lower(), default) if isinstance(value, str) else default
 
 
 def _clamp_number(value: Any, default, lo, hi, cast):
@@ -160,7 +160,7 @@ _CONFIG_ALIASES = (("captureSubagents", "capture_subagents"), ("captureHeadless"
 def _host_headless() -> bool:
     try:
         from agent.oneshot_footprint import is_single_query_session
-    except ImportError:  # older Hermes: no one-shot marker to read
+    except Exception:
         return False
     return bool(_quietly(is_single_query_session, default=False))
 
@@ -169,7 +169,7 @@ def _host_headless() -> bool:
 def _finite_turn() -> bool:
     try:
         from gateway.session_finite import finite_turn_required
-    except ImportError:
+    except Exception:
         return False
     return bool(_quietly(lambda: finite_turn_required() is True, default=False))
 
@@ -647,7 +647,6 @@ class SupermemoryMemoryProvider(MemoryProvider):
         opt_in = {key: _as_bool(get_secret(env, "") or "", config[key]) for key, env in
                   (("capture_subagents", "SUPERMEMORY_CAPTURE_SUBAGENTS"), ("capture_headless", "SUPERMEMORY_CAPTURE_HEADLESS"))}
         self._capture_headless = opt_in["capture_headless"]
-        # Subagent and helper forks, cron jobs and one-shot runs make no automatic calls unless opted in.
         self._hooks_enabled = not ((context in {"subagent", "flush"} and not opt_in["capture_subagents"])
                                    or ((context == "cron" or _host_headless()) and not self._capture_headless))
         if not self._hooks_enabled:
@@ -753,6 +752,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._captured_digest: Optional[str] = None
         self._unsent: Optional[dict] = None
         self._legacy_text: Optional[str] = None
+        self._finite_turns: Set[Tuple[str, str]] = set()
         self._turn_authors: Dict[int, tuple] = {}
         self._speakers: Dict[str, dict] = {}
 
@@ -814,6 +814,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
             turns = _turns_from_messages(messages)
             if completed_only and turns and not turns[-1]["assistant"]:
                 turns = turns[:-1]  # the transcript can run ahead of the turn being synced
+            turns = [t for t in turns if (t["user"], t["assistant"]) not in self._finite_turns]
             self._turns = turns or self._turns
             turns = self._without_legacy_turns(_join_turns(self._archive, self._turns))
             if not turns:
@@ -831,12 +832,16 @@ class SupermemoryMemoryProvider(MemoryProvider):
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "",
                   messages: Optional[list] = None, turn_author: Optional[dict] = None) -> None:
         # Host runs this on a worker thread, so the blocking write is fine here.
+        turn = {"user": _clean_text_for_capture(_message_text(user_content)),
+                "assistant": _clean_text_for_capture(_message_text(assistant_content))}
+        if self._hooks_enabled and not self._hooks_on():
+            completed = [t for t in _turns_from_messages(messages) if t["assistant"]]
+            self._finite_turns.update((t["user"], t["assistant"]) for t in [turn, *completed[-1:]])
+            return
         if not self._can_write() or not self._auto_capture:
             return
         if session_id and session_id != self._session_id:
             self.on_session_switch(session_id)
-        turn = {"user": _clean_text_for_capture(_message_text(user_content)),
-                "assistant": _clean_text_for_capture(_message_text(assistant_content))}
         if messages is None and turn["user"]:
             self._turns.append(turn)
         if self._per_speaker and self._can_write() and self._auto_capture:
@@ -873,6 +878,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
             turns = _turns_from_messages(messages) if messages is not None else self._turns
             if completed_only and turns and not turns[-1]["assistant"]:
                 turns = turns[:-1]
+            turns = [t for t in turns if (t["user"], t["assistant"]) not in self._finite_turns]
             own = _clean_text_for_capture(_without_compaction_summary(author[1])) if author else ""
             matches = [i for i, t in enumerate(turns) if t["user"] == own] if own else []
             synced = next((i for i in reversed(matches) if turns[i]["assistant"] == author[2]), matches[-1] if matches else None)

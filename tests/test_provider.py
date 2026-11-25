@@ -283,6 +283,62 @@ def test_finite_turn_is_read_per_call_not_frozen_at_init(api, tmp_path, monkeypa
     assert api.captures() == {"hermes_session-1": TURN1}
 
 
+FINITE = ("Run the nightly export", "Exported.")
+
+
+def test_finite_turn_stays_out_of_later_captures_and_session_end(api, tmp_path):
+    from gateway.session_finite import finite_turn_scope
+    provider = make_provider(tmp_path)
+    first = transcript(("Book the usual table", "Booked."))
+    provider.sync_turn("Book the usual table", "Booked.", messages=first)
+    finite = first + transcript(FINITE)
+    with finite_turn_scope(True):
+        assert provider.prefetch(FINITE[0]) == ""
+        provider.sync_turn(*FINITE, messages=finite)
+    assert api.captures() == {"hermes_session-1": TURN1}
+    second = finite + transcript(("And a cab at 7.", "Cab booked."))
+    provider.sync_turn("And a cab at 7.", "Cab booked.", messages=second)
+    provider.on_session_end(second)
+    provider.shutdown()
+    assert api.captures() == {"hermes_session-1": TURN1 + "\n\n" + TURN2}
+
+
+def test_finite_only_session_writes_nothing_at_session_end(api, tmp_path):
+    from gateway.session_finite import finite_turn_scope
+    provider = make_provider(tmp_path)
+    messages = transcript(FINITE)
+    with finite_turn_scope(True):
+        provider.prefetch(FINITE[0])
+        provider.sync_turn(*FINITE, messages=messages)
+    provider.on_session_end(messages)
+    provider.shutdown()
+    assert api.writes() == []
+
+
+def test_finite_turn_stays_out_of_group_speaker_documents(api, tmp_path):
+    from gateway.session_finite import finite_turn_scope
+    scope(tmp_path, "user")
+    provider = make_provider(tmp_path, **{**GATEWAY, "chat_type": "group"})
+    one = transcript(("Book the usual table", "Booked."))
+    group_turn(provider, "42", one)
+    finite = one + transcript(FINITE)
+    with finite_turn_scope(True):
+        group_turn(provider, "7", finite)
+    two = finite + transcript(("And a cab at 7.", "Cab booked."))
+    group_turn(provider, "42", two)
+    provider.on_session_end(two)
+    assert api.captures() == {"hermes:telegram:user:42/hermes_session-1": TURN1 + "\n\n" + TURN2}
+
+
+def test_finite_turn_is_captured_when_headless_capture_is_on(api, tmp_path):
+    from gateway.session_finite import finite_turn_scope
+    (tmp_path / "supermemory.json").write_text(json.dumps({"capture_headless": 1}))
+    provider = make_provider(tmp_path)
+    with finite_turn_scope(True):
+        provider.sync_turn("Book the usual table", "Booked.", messages=transcript(("Book the usual table", "Booked.")))
+    assert api.captures() == {"hermes_session-1": TURN1}
+
+
 @pytest.mark.parametrize("key", ["capture_headless", "captureHeadless"])
 def test_headless_flag_accepts_snake_and_camel_case(api, tmp_path, monkeypatch, key):
     monkeypatch.setattr(sm, "_host_headless", lambda: True)

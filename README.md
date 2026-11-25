@@ -130,7 +130,7 @@ Hermes tells the provider what kind of session it is. By default the plugin make
 
 - subagent and helper sessions, which Hermes starts with `agent_context` `subagent` or `flush`: `delegate_task` children, the curator, batch runs
 - cron jobs (`agent_context: cron`)
-- one-shot runs, which Hermes marks as such: `hermes -z`, `--oneshot`, `-Q` and stream-json runs always, and `hermes chat -q` when stdin or stdout is not a terminal (on a terminal `-q` seeds an interactive session), which is how scripts and CI usually start workers. A finite turn submitted to an existing gateway session is skipped for that turn only; later interactive turns in the session recall and capture as usual
+- one-shot runs, which Hermes marks as such: `hermes -z`, `--oneshot`, `-Q` and stream-json runs always, and `hermes chat -q` when stdin or stdout is not a terminal (on a terminal `-q` seeds an interactive session), which is how scripts and CI usually start workers. A finite turn the gateway admits into a session (`hermes chat -q --source tool`, or `-q --resume` into an interactive session) gets no recall and stays out of that session's document, including the session-end capture; later interactive turns recall and capture as usual
 
 Title generation, compression summaries and background review are plain model calls or run without a memory provider, so they never reach the plugin.
 
